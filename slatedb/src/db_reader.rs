@@ -1431,6 +1431,11 @@ impl DbReaderSnapshot {
         self.started_seq
     }
 
+    /// Returns the last WAL file replayed into this snapshot's pinned state.
+    pub fn last_wal_id(&self) -> u64 {
+        self.state.last_wal_id
+    }
+
     pub async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Bytes>, crate::Error> {
         self.get_with_options(key, &ReadOptions::default()).await
     }
@@ -2647,12 +2652,14 @@ mod tests {
             .unwrap();
         let snapshot = reader.snapshot().await.unwrap();
         let snapshot_seq = snapshot.seq();
+        let snapshot_wal_id = snapshot.last_wal_id();
 
         db.put(b"key", b"after").await.unwrap();
         db.flush().await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         assert_eq!(snapshot.seq(), snapshot_seq);
+        assert_eq!(snapshot.last_wal_id(), snapshot_wal_id);
         assert_eq!(
             snapshot.get(b"key").await.unwrap(),
             Some(Bytes::from_static(b"before"))
