@@ -913,6 +913,21 @@ impl VersionedManifest {
         self.manifest.core.last_l0_seq
     }
 
+    /// Returns the next WAL SST identifier the writer will allocate.
+    ///
+    /// Readers that publish a derived object-store index can persist
+    /// `next_wal_sst_id - 1` as the last WAL file covered by that index and
+    /// then consume only newer WAL files when applying an incremental tail.
+    pub fn next_wal_sst_id(&self) -> u64 {
+        self.manifest.core.next_wal_sst_id
+    }
+
+    /// Returns the WAL SST identifier through which data has been folded into
+    /// durable L0 state.
+    pub fn replay_after_wal_id(&self) -> u64 {
+        self.manifest.core.replay_after_wal_id
+    }
+
     /// Returns the minimum sequence number still visible to recent snapshots.
     pub fn recent_snapshot_min_seq(&self) -> u64 {
         self.manifest.core.recent_snapshot_min_seq
