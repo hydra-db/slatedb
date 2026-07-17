@@ -2039,6 +2039,15 @@ impl Db {
     pub fn status(&self) -> DbStatus {
         <Self as DbMetadataOps>::status(self)
     }
+
+    /// Returns the highest WAL SST id durably flushed by this writer.
+    ///
+    /// This is an object-store durability frontier, not a manifest-compaction
+    /// frontier. Readers can use it as an inclusive upper bound and still
+    /// filter WAL entries by a pinned snapshot sequence.
+    pub fn last_flushed_wal_id(&self) -> u64 {
+        self.inner.wal_observer.status().last_flushed_wal_id
+    }
 }
 
 #[async_trait::async_trait]
