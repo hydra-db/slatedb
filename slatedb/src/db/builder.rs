@@ -2057,6 +2057,11 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         let latest_manifest =
             StoredManifest::try_load(Arc::clone(&manifest_store), self.system_clock.clone())
                 .await?;
+        if latest_manifest.is_none() {
+            return Err(crate::Error::database_missing(format!(
+                "no database initialized at object-store path {path}"
+            )));
+        }
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
                 .db_state()
