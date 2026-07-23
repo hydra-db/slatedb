@@ -41,10 +41,13 @@ use {
     std::{
         collections::{BTreeSet, VecDeque},
         ops::Sub,
-        sync::{Arc, LazyLock},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, LazyLock,
+        },
     },
     tokio::runtime::Handle,
-    tokio::sync::{OwnedRwLockReadGuard, RwLock as AsyncRwLock},
+    tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock as AsyncRwLock},
     uuid::Uuid,
 };
 
@@ -136,6 +139,9 @@ struct DbReaderInner {
     mode: DbReaderMode,
     state: RwLock<Arc<ReaderState>>,
     snapshot_gate: Arc<AsyncRwLock<()>>,
+    close_gate: Mutex<()>,
+    closing: AtomicBool,
+    active_snapshots: AtomicUsize,
     system_clock: Arc<dyn SystemClock>,
     oracle: Arc<DbReaderOracle>,
     reader: Reader,
@@ -286,6 +292,9 @@ impl DbReaderInner {
             mode,
             state,
             snapshot_gate: Arc::new(AsyncRwLock::new(())),
+            close_gate: Mutex::new(()),
+            closing: AtomicBool::new(false),
+            active_snapshots: AtomicUsize::new(0),
             system_clock,
             oracle,
             reader,
@@ -1364,8 +1373,19 @@ impl DbReader {
     /// writer from advancing the database, and it does not write a new manifest.
     pub async fn snapshot(&self) -> Result<Arc<DbReaderSnapshot>, crate::Error> {
         self.inner.check_closed()?;
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(SlateDBError::Closed.into());
+        }
         let refresh_guard = Arc::clone(&self.inner.snapshot_gate).read_owned().await;
-        self.inner.check_closed()?;
+        self.inner.active_snapshots.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = self.inner.check_closed() {
+            self.inner.active_snapshots.fetch_sub(1, Ordering::AcqRel);
+            return Err(error.into());
+        }
+        if self.inner.closing.load(Ordering::Acquire) {
+            self.inner.active_snapshots.fetch_sub(1, Ordering::AcqRel);
+            return Err(SlateDBError::Closed.into());
+        }
         let state = Arc::clone(&self.inner.state.read());
         let started_seq = state
             .last_remote_persisted_seq
@@ -1412,6 +1432,12 @@ impl DbReader {
     /// }
     /// ```
     pub async fn close(&self) -> Result<(), crate::Error> {
+        let _close_guard = self.inner.close_gate.lock().await;
+        let first_close = !self.inner.closing.swap(true, Ordering::AcqRel);
+        if first_close && self.inner.active_snapshots.load(Ordering::Acquire) != 0 {
+            self.inner.closing.store(false, Ordering::Release);
+            return Err(SlateDBError::ActiveReaderSnapshots.into());
+        }
         self.task_executor
             .shutdown_task(DB_READER_TASK_NAME)
             .await
@@ -1547,6 +1573,12 @@ impl DbReaderSnapshot {
             )
             .await
             .map_err(Into::into)
+    }
+}
+
+impl Drop for DbReaderSnapshot {
+    fn drop(&mut self) {
+        self.inner.active_snapshots.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2715,6 +2747,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_reader_for_uninitialized_path_reports_database_missing() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let error = match DbReader::open(
+            "/tmp/test_reader_missing_database",
+            object_store,
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderOptions::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("reader open must reject an uninitialized database"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::DatabaseMissing);
+    }
+
+    #[tokio::test]
+    async fn close_rejects_active_snapshot_without_waiting_for_its_guard() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_close_with_snapshot");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let reader = DbReader::open(
+            path,
+            object_store,
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let snapshot = reader.snapshot().await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), reader.close())
+            .await
+            .expect("close must not wait on a snapshot owned by its caller")
+            .expect_err("close must reject active snapshots");
+        assert_eq!(error.kind(), crate::ErrorKind::Invalid);
+
+        drop(snapshot);
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn replay_wal_into_should_use_latest_existing_table_and_keep_newest_first_order() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_replay_order");
@@ -3683,6 +3761,9 @@ mod tests {
             mode: DbReaderMode::ManagedCheckpoint,
             state: parking_lot::RwLock::new(Arc::new(prior_state)),
             snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
+            close_gate: tokio::sync::Mutex::new(()),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            active_snapshots: AtomicUsize::new(0),
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
@@ -3771,6 +3852,9 @@ mod tests {
             mode: DbReaderMode::ManagedCheckpoint,
             state: parking_lot::RwLock::new(Arc::new(prior_state)),
             snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
+            close_gate: tokio::sync::Mutex::new(()),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            active_snapshots: AtomicUsize::new(0),
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,

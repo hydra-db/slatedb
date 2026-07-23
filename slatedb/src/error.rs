@@ -74,6 +74,9 @@ pub(crate) enum SlateDBError {
     #[error("invalid DB state error")]
     InvalidDBState,
 
+    #[error("cannot close database reader while snapshots are active")]
+    ActiveReaderSnapshots,
+
     #[error("wal store reconfiguration unsupported")]
     WalStoreReconfigurationError,
 
@@ -614,6 +617,15 @@ impl Error {
         }
     }
 
+    /// Creates an error indicating that no database exists at the requested path.
+    pub(crate) fn database_missing(msg: String) -> Self {
+        Self {
+            msg,
+            kind: ErrorKind::DatabaseMissing,
+            source: None,
+        }
+    }
+
     /// Creates a new internal error.
     pub fn internal(msg: String) -> Self {
         Self {
@@ -696,6 +708,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::EmptySegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),
             SlateDBError::InvalidDeletion => Error::invalid(msg),
+            SlateDBError::ActiveReaderSnapshots => Error::invalid(msg),
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),
             SlateDBError::MergeOperatorMissing => Error::invalid(msg),
             SlateDBError::IncompatibleMergeTtls { .. } => Error::invalid(msg),
@@ -722,11 +735,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::CheckpointMissing(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
-            LatestTransactionalObjectVersionMissing => Error {
-                msg,
-                kind: ErrorKind::DatabaseMissing,
-                source: None,
-            },
+            LatestTransactionalObjectVersionMissing => Error::data(msg),
             TransactionalObjectVersionExists => Error::data(msg),
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
@@ -797,9 +806,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_latest_manifest_maps_to_database_missing() {
+    fn missing_latest_transactional_object_remains_a_data_error() {
         let public_err = Error::from(LatestTransactionalObjectVersionMissing);
 
-        assert_eq!(public_err.kind(), ErrorKind::DatabaseMissing);
+        assert_eq!(public_err.kind(), ErrorKind::Data);
     }
 }
