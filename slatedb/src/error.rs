@@ -532,6 +532,13 @@ pub enum ErrorKind {
     /// or drop the operation.
     Data,
 
+    /// No database has been initialized at the requested object-store path.
+    ///
+    /// A caller may treat this as an empty logical database or initialize a new writer. This is
+    /// distinct from [`ErrorKind::Data`], which indicates that persisted state exists but is
+    /// invalid or unavailable in its expected form.
+    DatabaseMissing,
+
     /// An unexpected internal error occurred. Users should not expect to see this error.
     /// Please [open a Github issue](https://github.com/slatedb/slatedb/issues/new?template=bug_report.md&title=Internal+error+returned)
     /// if you receive this error.
@@ -555,6 +562,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::Unavailable => write!(f, "Unavailable error"),
             ErrorKind::Invalid => write!(f, "Invalid error"),
             ErrorKind::Data => write!(f, "Data error"),
+            ErrorKind::DatabaseMissing => write!(f, "Database missing error"),
             ErrorKind::Internal => write!(f, "Internal error"),
         }
     }
@@ -785,7 +793,11 @@ impl From<SlateDBError> for Error {
             SlateDBError::CheckpointMissing(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
-            LatestTransactionalObjectVersionMissing => Error::data(msg),
+            LatestTransactionalObjectVersionMissing => Error {
+                msg,
+                kind: ErrorKind::DatabaseMissing,
+                source: None,
+            },
             TransactionalObjectVersionExists => Error::data(msg),
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
@@ -946,5 +958,12 @@ mod tests {
             source: Box::new(std::io::Error::other("missing")),
         });
         assert!(matches!(err, SlateDBError::ObjectStoreError(_)));
+    }
+
+    #[test]
+    fn missing_latest_manifest_maps_to_database_missing() {
+        let public_err = Error::from(LatestTransactionalObjectVersionMissing);
+
+        assert_eq!(public_err.kind(), ErrorKind::DatabaseMissing);
     }
 }
