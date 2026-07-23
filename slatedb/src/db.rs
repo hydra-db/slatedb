@@ -2046,7 +2046,9 @@ impl Db {
     /// frontier. Readers can use it as an inclusive upper bound and still
     /// filter WAL entries by a pinned snapshot sequence.
     pub fn last_flushed_wal_id(&self) -> u64 {
-        self.inner.wal_observer.status().last_flushed_wal_id
+        match self.inner.wal_observer.status() {
+            Ok(status) | Err(status) => status.last_flushed_wal_id,
+        }
     }
 }
 

@@ -398,6 +398,7 @@ impl From<SlateDBError> for WalError {
             ErrorKind::Unavailable => WalError::Unavailable(Arc::new(value)),
             ErrorKind::Invalid => WalError::InternalError(Arc::new(value)),
             ErrorKind::Data => WalError::DataError(Arc::new(value)),
+            ErrorKind::DatabaseMissing => WalError::DataError(Arc::new(value)),
             ErrorKind::Internal => WalError::InternalError(Arc::new(value)),
             ErrorKind::Transaction => WalError::InternalError(Arc::new(value)),
         }
