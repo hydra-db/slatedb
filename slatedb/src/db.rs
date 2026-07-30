@@ -790,6 +790,18 @@ impl Db {
         Ok(snapshot)
     }
 
+    /// Create a snapshot pinned to the latest remotely durable sequence.
+    ///
+    /// Unlike [`Self::snapshot`], the returned sequence never names a write
+    /// that is committed in memory but still waiting for its WAL to reach
+    /// object storage. This is useful when every read from the snapshot uses
+    /// [`crate::config::DurabilityLevel::Remote`].
+    pub async fn durable_snapshot(&self) -> Result<Arc<DbSnapshot>, crate::Error> {
+        self.inner.check_closed()?;
+        let durable_sequence = self.inner.oracle.last_remote_persisted_seq();
+        Ok(DbSnapshot::new(self.inner.clone(), Some(durable_sequence)))
+    }
+
     /// Get a value from the database with default read options.
     ///
     /// The `Bytes` object returned contains a slice of an entire
