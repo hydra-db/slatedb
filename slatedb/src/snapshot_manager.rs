@@ -42,7 +42,8 @@ impl SnapshotManager {
         (snapshot_id, seq)
     }
 
-    /// Atomically capture and register the latest remotely durable sequence.
+    /// Atomically capture and register the latest remotely durable sequence
+    /// that is also committed and visible to readers.
     ///
     /// The sequence must be selected while holding the same lock used by
     /// `min_active_seq`. Otherwise a flush can observe no active snapshot and
@@ -50,7 +51,10 @@ impl SnapshotManager {
     pub(crate) fn new_durable_snapshot(&self) -> (Uuid, u64) {
         let snapshot_id = self.db_rand.rng().gen_uuid();
         let mut inner = self.inner.write();
-        let seq = inner.oracle.last_remote_persisted_seq();
+        let seq = inner
+            .oracle
+            .last_remote_persisted_seq()
+            .min(inner.oracle.last_committed_seq());
         inner.active_snapshots.insert(snapshot_id, seq);
         (snapshot_id, seq)
     }
@@ -83,12 +87,19 @@ mod tests {
     use crate::db_status::DbStatusManager;
 
     fn new_snapshot_manager(seq: u64) -> SnapshotManager {
+        new_snapshot_manager_with_sequences(seq, seq)
+    }
+
+    fn new_snapshot_manager_with_sequences(
+        last_committed_seq: u64,
+        last_durable_seq: u64,
+    ) -> SnapshotManager {
         SnapshotManager::new(
             Arc::new(DbOracle::new(
-                seq,
-                seq,
-                seq,
-                Arc::new(DbStatusManager::new(seq)),
+                last_committed_seq.max(last_durable_seq),
+                last_committed_seq,
+                last_durable_seq,
+                Arc::new(DbStatusManager::new(last_durable_seq)),
             )),
             Arc::new(DbRand::new(0)),
         )
@@ -109,6 +120,15 @@ mod tests {
         let (_, seq) = mgr.new_durable_snapshot();
         assert_eq!(seq, 123);
         assert_eq!(mgr.min_active_seq(), Some(123));
+    }
+
+    #[test]
+    fn test_new_durable_snapshot_does_not_name_uncommitted_remote_sequence() {
+        let mgr = new_snapshot_manager_with_sequences(122, 123);
+
+        let (_, seq) = mgr.new_durable_snapshot();
+        assert_eq!(seq, 122);
+        assert_eq!(mgr.min_active_seq(), Some(122));
     }
 
     #[test]

@@ -789,9 +789,18 @@ mod tests {
         // Sleep for 1 second to ensure the put is in the memtable but not committed
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // At this point the data is in the memtable but not committed; create the snapshot
+        // At this point the data is in the memtable and its WAL has reached remote
+        // storage, but the batch is not committed for reader visibility.
+        assert!(
+            db.inner.oracle.last_remote_persisted_seq() > recent_committed_seq,
+            "paused write should reach remote durability before it becomes committed"
+        );
+
+        // Neither snapshot kind may name the uncommitted WAL sequence.
         let snapshot = db.snapshot()?;
         assert_eq!(snapshot.seq(), recent_committed_seq);
+        let durable_snapshot = db.durable_snapshot().await?;
+        assert_eq!(durable_snapshot.seq(), recent_committed_seq);
 
         // Turn off the failpoint to let the put complete
         fail_parallel::cfg(fp_registry.clone(), "write-batch-pre-commit", "off").unwrap();
@@ -802,6 +811,8 @@ mod tests {
         // Assert the snapshot should not contain the new value
         let snapshot_result = snapshot.get(b"key1").await?;
         assert_eq!(snapshot_result, Some(Bytes::from("value1")));
+        let durable_snapshot_result = durable_snapshot.get(b"key1").await?;
+        assert_eq!(durable_snapshot_result, Some(Bytes::from("value1")));
 
         let db_result = db.get(b"key1").await?;
         assert_eq!(db_result, Some(Bytes::from("value2")));
