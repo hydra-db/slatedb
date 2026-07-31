@@ -509,6 +509,30 @@ impl KVTable {
         ordering: IterationOrder,
     ) -> MemTableIterator {
         let internal_range = KVTableInternalKeyRange::from(range);
+        self.range_internal(internal_range, ordering)
+    }
+
+    pub(crate) fn point_range(
+        &self,
+        key: Bytes,
+        max_seq: Option<u64>,
+        ordering: IterationOrder,
+    ) -> MemTableIterator {
+        let internal_range = KVTableInternalKeyRange {
+            start_bound: Bound::Included(SequencedKey::new(
+                key.clone(),
+                max_seq.unwrap_or(u64::MAX),
+            )),
+            end_bound: Bound::Included(SequencedKey::new(key, 0)),
+        };
+        self.range_internal(internal_range, ordering)
+    }
+
+    fn range_internal(
+        &self,
+        internal_range: KVTableInternalKeyRange,
+        ordering: IterationOrder,
+    ) -> MemTableIterator {
         let mut iterator = MemTableIteratorInnerBuilder {
             map: self.map.clone(),
             inner_builder: |map| map.range(internal_range),
@@ -625,6 +649,29 @@ mod tests {
             vec![
                 RowEntry::new_value(b"abc111", b"value1", 2),
                 RowEntry::new_value(b"abc333", b"value3", 1),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_point_range_excludes_versions_newer_than_snapshot() {
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"key", b"old", 1));
+        table.put(RowEntry::new_tombstone(b"key", 2));
+        table.put(RowEntry::new_value(b"key", b"future", 3));
+        table.put(RowEntry::new_value(b"next", b"other", 1));
+
+        let mut iter = table.table().point_range(
+            Bytes::from_static(b"key"),
+            Some(2),
+            IterationOrder::Ascending,
+        );
+        assert_iterator(
+            &mut iter,
+            vec![
+                RowEntry::new_tombstone(b"key", 2),
+                RowEntry::new_value(b"key", b"old", 1),
             ],
         )
         .await;

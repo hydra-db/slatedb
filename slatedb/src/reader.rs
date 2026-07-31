@@ -133,6 +133,7 @@ impl Reader {
     async fn build_iterator_sources(
         &self,
         range: &BytesRange,
+        point_key: Option<&Bytes>,
         db_state: &(dyn DbStateReader + Sync),
         write_batch_iter: Option<WriteBatchIterator>,
         sst_iter_options: &SstIteratorOptions,
@@ -147,8 +148,11 @@ impl Reader {
         let mem_iters = memtables
             .iter()
             .map(|table| {
-                Box::new(table.range(range.clone(), sst_iter_options.order))
-                    as Box<dyn RowEntryIterator + 'static>
+                let iterator = match point_key {
+                    Some(key) => table.point_range(key.clone(), max_seq, sst_iter_options.order),
+                    None => table.range(range.clone(), sst_iter_options.order),
+                };
+                Box::new(iterator) as Box<dyn RowEntryIterator + 'static>
             })
             .collect::<Vec<_>>();
 
@@ -212,6 +216,7 @@ impl Reader {
         let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
         let key_slice = key.as_ref();
         let range = BytesRange::from_slice(key_slice..=key_slice);
+        let point_key = Bytes::copy_from_slice(key_slice);
 
         let sst_iter_options = SstIteratorOptions {
             cache_blocks: options.cache_blocks,
@@ -227,6 +232,7 @@ impl Reader {
         } = self
             .build_iterator_sources(
                 &range,
+                Some(&point_key),
                 db_state,
                 write_batch_iter,
                 &sst_iter_options,
@@ -299,6 +305,7 @@ impl Reader {
         } = self
             .build_iterator_sources(
                 &range,
+                None,
                 ctx.db_state,
                 ctx.write_batch_iter,
                 &sst_iter_options,
