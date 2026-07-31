@@ -42,6 +42,19 @@ impl SnapshotManager {
         (snapshot_id, seq)
     }
 
+    /// Atomically capture and register the latest remotely durable sequence.
+    ///
+    /// The sequence must be selected while holding the same lock used by
+    /// `min_active_seq`. Otherwise a flush can observe no active snapshot and
+    /// discard an older version between sequence selection and registration.
+    pub(crate) fn new_durable_snapshot(&self) -> (Uuid, u64) {
+        let snapshot_id = self.db_rand.rng().gen_uuid();
+        let mut inner = self.inner.write();
+        let seq = inner.oracle.last_remote_persisted_seq();
+        inner.active_snapshots.insert(snapshot_id, seq);
+        (snapshot_id, seq)
+    }
+
     pub(crate) fn drop_snapshot(&self, snapshot_id: &Uuid) {
         let mut inner = self.inner.write();
         let removed = inner.active_snapshots.remove(snapshot_id);
@@ -87,6 +100,15 @@ mod tests {
 
         let (_, seq) = mgr.new_snapshot(None);
         assert_eq!(seq, 123);
+    }
+
+    #[test]
+    fn test_new_durable_snapshot_uses_remote_oracle_seq() {
+        let mgr = new_snapshot_manager(123);
+
+        let (_, seq) = mgr.new_durable_snapshot();
+        assert_eq!(seq, 123);
+        assert_eq!(mgr.min_active_seq(), Some(123));
     }
 
     #[test]

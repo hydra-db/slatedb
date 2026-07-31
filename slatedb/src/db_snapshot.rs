@@ -21,6 +21,16 @@ impl DbSnapshot {
     pub(crate) fn new(db_inner: Arc<DbInner>, seq: Option<u64>) -> Arc<Self> {
         let (snapshot_id, started_seq) = db_inner.snapshot_manager.new_snapshot(seq);
 
+        Self::from_registration(db_inner, snapshot_id, started_seq)
+    }
+
+    pub(crate) fn new_durable(db_inner: Arc<DbInner>) -> Arc<Self> {
+        let (snapshot_id, started_seq) = db_inner.snapshot_manager.new_durable_snapshot();
+
+        Self::from_registration(db_inner, snapshot_id, started_seq)
+    }
+
+    fn from_registration(db_inner: Arc<DbInner>, snapshot_id: Uuid, started_seq: u64) -> Arc<Self> {
         Arc::new(Self {
             snapshot_id,
             started_seq,
