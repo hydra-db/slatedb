@@ -813,7 +813,7 @@ mod tests {
     ) -> Result<(), Error> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Arc::new(Db::open("snapshot_concurrent_rewrites", object_store).await?);
-        let first_txn = db.begin(IsolationLevel::SerializableSnapshot).await?;
+        let first_txn = db.begin(IsolationLevel::SerializableSnapshot)?;
         let first_sequence = first_txn.seqnum() + 1;
         first_txn.put(b"key", b"present")?;
         first_txn.put(b"degree", first_sequence.to_be_bytes())?;
@@ -824,11 +824,12 @@ mod tests {
         )?;
         let first = first_txn
             .commit_with_options(&WriteOptions {
-                await_durable: true,
                 seqnum: first_sequence,
+                ..WriteOptions::default()
             })
             .await?
             .expect("initial transaction must contain a write");
+        first.await_durable().await?;
         let history = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([(
             first.seqnum(),
             Some(Bytes::from_static(b"present")),
@@ -843,7 +844,6 @@ mod tests {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let delete_txn = db
                         .begin(IsolationLevel::SerializableSnapshot)
-                        .await
                         .unwrap();
                     let delete_sequence = delete_txn.seqnum() + 1;
                     delete_txn.delete(b"key").unwrap();
@@ -861,16 +861,16 @@ mod tests {
                         .unwrap();
                     let deleted = delete_txn
                         .commit_with_options(&WriteOptions {
-                            await_durable: true,
                             seqnum: delete_sequence,
+                            ..WriteOptions::default()
                         })
                         .await
                         .unwrap()
                         .expect("delete transaction must contain a write");
+                    deleted.await_durable().await.unwrap();
                     history.lock().unwrap().insert(deleted.seqnum(), None);
                     let insert_txn = db
                         .begin(IsolationLevel::SerializableSnapshot)
-                        .await
                         .unwrap();
                     let insert_sequence = insert_txn.seqnum() + 1;
                     insert_txn.put(b"key", b"present").unwrap();
@@ -888,12 +888,13 @@ mod tests {
                         .unwrap();
                     let inserted = insert_txn
                         .commit_with_options(&WriteOptions {
-                            await_durable: true,
                             seqnum: insert_sequence,
+                            ..WriteOptions::default()
                         })
                         .await
                         .unwrap()
                         .expect("insert transaction must contain a write");
+                    inserted.await_durable().await.unwrap();
                     history
                         .lock()
                         .unwrap()

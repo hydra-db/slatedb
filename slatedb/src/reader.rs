@@ -143,6 +143,8 @@ impl Reader {
 
     fn build_memtable_iters(
         range: &BytesRange,
+        point_key: Option<&Bytes>,
+        max_seq: Option<u64>,
         db_state: &(dyn DbStateReader + Sync),
         order: IterationOrder,
         read_trace: ReadTrace,
@@ -156,8 +158,11 @@ impl Reader {
         memtables
             .iter()
             .map(|table| {
-                Box::new(table.range(range.clone(), order, read_trace.clone()))
-                    as Box<dyn RowEntryIterator + 'static>
+                let iterator = match point_key {
+                    Some(key) => table.point_range(key.clone(), max_seq, order, read_trace.clone()),
+                    None => table.range(range.clone(), order, read_trace.clone()),
+                };
+                Box::new(iterator) as Box<dyn RowEntryIterator + 'static>
             })
             .collect()
     }
@@ -165,6 +170,7 @@ impl Reader {
     async fn build_iterator_sources(
         &self,
         range: &BytesRange,
+        point_key: Option<&Bytes>,
         db_state: &(dyn DbStateReader + Sync),
         write_batch_iter: Option<WriteBatchIterator>,
         sst_iter_options: &SstIteratorOptions,
@@ -173,8 +179,14 @@ impl Reader {
         max_seq: Option<u64>,
         read_trace: ReadTrace,
     ) -> Result<IteratorSources, SlateDBError> {
-        let mem_iters =
-            Self::build_memtable_iters(range, db_state, sst_iter_options.order, read_trace.clone());
+        let mem_iters = Self::build_memtable_iters(
+            range,
+            point_key,
+            max_seq,
+            db_state,
+            sst_iter_options.order,
+            read_trace.clone(),
+        );
 
         let default_seg;
         let segments: &[Segment] = match db_state.core().select_segments(range) {
@@ -258,6 +270,7 @@ impl Reader {
         let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
         let key_slice = key.as_ref();
         let range = BytesRange::from_slice(key_slice..=key_slice);
+        let point_key = Bytes::copy_from_slice(key_slice);
 
         let sst_iter_options = SstIteratorOptions {
             cache_blocks: options.cache_blocks,
@@ -273,6 +286,7 @@ impl Reader {
         } = self
             .build_iterator_sources(
                 &range,
+                Some(&point_key),
                 db_state,
                 write_batch_iter,
                 &sst_iter_options,
@@ -371,6 +385,7 @@ impl Reader {
         } = self
             .build_iterator_sources(
                 &range,
+                None,
                 ctx.db_state,
                 ctx.write_batch_iter,
                 &sst_iter_options,
