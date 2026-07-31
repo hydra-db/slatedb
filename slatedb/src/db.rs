@@ -798,8 +798,7 @@ impl Db {
     /// [`crate::config::DurabilityLevel::Remote`].
     pub async fn durable_snapshot(&self) -> Result<Arc<DbSnapshot>, crate::Error> {
         self.inner.check_closed()?;
-        let durable_sequence = self.inner.oracle.last_remote_persisted_seq();
-        Ok(DbSnapshot::new(self.inner.clone(), Some(durable_sequence)))
+        Ok(DbSnapshot::new_durable(self.inner.clone()))
     }
 
     /// Get a value from the database with default read options.
