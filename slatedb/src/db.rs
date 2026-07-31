@@ -790,7 +790,8 @@ impl Db {
         Ok(snapshot)
     }
 
-    /// Create a snapshot pinned to the latest remotely durable sequence.
+    /// Create a snapshot pinned to the latest sequence that is both remotely
+    /// durable and committed for reader visibility.
     ///
     /// Unlike [`Self::snapshot`], the returned sequence never names a write
     /// that is committed in memory but still waiting for its WAL to reach
