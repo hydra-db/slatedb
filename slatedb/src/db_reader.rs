@@ -229,6 +229,7 @@ impl DbReaderInner {
                     &status_manager,
                     Arc::clone(&system_clock),
                     SlateDbWalReaderOptions {
+                        sst_batch_size: options.wal_replay_concurrency,
                         read_ahead_bytes: options.max_memtable_bytes as usize,
                         ..SlateDbWalReaderOptions::default()
                     },
@@ -894,6 +895,9 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
 impl DbReader {
     fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
+        if options.wal_replay_concurrency == 0 {
+            return Err(SlateDBError::InvalidSSTBatchSize(0));
+        }
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -1816,6 +1820,18 @@ mod tests {
             self.last_wal_file_id_calls.fetch_add(1, Ordering::Relaxed);
             Ok(10)
         }
+    }
+
+    #[test]
+    fn reader_rejects_zero_wal_replay_concurrency() {
+        let options = DbReaderOptions {
+            wal_replay_concurrency: 0,
+            ..DbReaderOptions::default()
+        };
+        assert!(matches!(
+            DbReader::validate_options(DbReaderMode::ManagedCheckpoint, &options),
+            Err(SlateDBError::InvalidSSTBatchSize(0))
+        ));
     }
 
     #[tokio::test]
