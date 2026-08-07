@@ -140,7 +140,7 @@ use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheWrapper, UnownedDbCache};
-use crate::db_reader::{DbReader, DbReaderMode};
+use crate::db_reader::{DbReader, DbReaderMode, DEFAULT_WAL_REPLAY_CONCURRENCY};
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
@@ -1682,6 +1682,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     options: DbReaderOptions,
+    wal_replay_concurrency: usize,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
@@ -1702,6 +1703,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             filter_policies: default_filter_policies(),
             segment_extractor: None,
             options: DbReaderOptions::default(),
+            wal_replay_concurrency: DEFAULT_WAL_REPLAY_CONCURRENCY,
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
@@ -1749,6 +1751,18 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// Sets the options to use for the reader.
     pub fn with_options(mut self, options: DbReaderOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Sets the maximum number of immutable WAL SSTs opened concurrently while
+    /// the reader is established or refreshed.
+    ///
+    /// Raising this value can reduce cold-reader latency for databases with a
+    /// long uncompacted WAL tail at the cost of additional object-store
+    /// requests and temporary replay memory. The default is 4, preserving the
+    /// historical replay behavior.
+    pub fn with_wal_replay_concurrency(mut self, concurrency: usize) -> Self {
+        self.wal_replay_concurrency = concurrency;
         self
     }
 
@@ -1954,6 +1968,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             self.merge_operator,
             self.segment_extractor,
             self.options,
+            self.wal_replay_concurrency,
             self.system_clock,
             self.rand,
             recorder,

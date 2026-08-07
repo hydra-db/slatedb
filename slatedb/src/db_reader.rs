@@ -52,6 +52,7 @@ use {
 };
 
 pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
+pub(crate) const DEFAULT_WAL_REPLAY_CONCURRENCY: usize = 4;
 
 /// Determines how a [`DbReader`] chooses and refreshes the database state it reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -199,6 +200,7 @@ impl DbReaderInner {
         wal_store: Arc<WalTableStore>,
         wal_reader: Option<Arc<dyn WalReaderTrait>>,
         options: DbReaderOptions,
+        wal_replay_concurrency: usize,
         mode: DbReaderMode,
         merge_operator: Option<MergeOperatorType>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
@@ -229,7 +231,7 @@ impl DbReaderInner {
                     &status_manager,
                     Arc::clone(&system_clock),
                     SlateDbWalReaderOptions {
-                        sst_batch_size: options.wal_replay_concurrency,
+                        sst_batch_size: wal_replay_concurrency,
                         read_ahead_bytes: options.max_memtable_bytes as usize,
                         ..SlateDbWalReaderOptions::default()
                     },
@@ -894,8 +896,12 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 }
 
 impl DbReader {
-    fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
-        if options.wal_replay_concurrency == 0 {
+    fn validate_options(
+        mode: DbReaderMode,
+        options: &DbReaderOptions,
+        wal_replay_concurrency: usize,
+    ) -> Result<(), SlateDBError> {
+        if wal_replay_concurrency == 0 {
             return Err(SlateDBError::InvalidSSTBatchSize(0));
         }
         if mode != DbReaderMode::ManagedCheckpoint {
@@ -1006,11 +1012,12 @@ impl DbReader {
         merge_operator: Option<MergeOperatorType>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         options: DbReaderOptions,
+        wal_replay_concurrency: usize,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
         recorder: slatedb_common::metrics::MetricsRecorderHelper,
     ) -> Result<Self, SlateDBError> {
-        Self::validate_options(mode, &options)?;
+        Self::validate_options(mode, &options, wal_replay_concurrency)?;
 
         let manifest =
             StoredManifest::load(Arc::clone(&manifest_store), system_clock.clone()).await?;
@@ -1029,6 +1036,7 @@ impl DbReader {
                 wal_store,
                 wal_reader,
                 options,
+                wal_replay_concurrency,
                 mode,
                 merge_operator,
                 segment_extractor,
@@ -1736,7 +1744,10 @@ impl DbCacheManagerOps for DbReader {
 mod tests {
     use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
     use {
-        super::{DbReaderMessage, ManifestPoller, ReaderState, WalReplayEnd},
+        super::{
+            DbReaderMessage, ManifestPoller, ReaderState, WalReplayEnd,
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
+        },
         crate::{
             block_cache_policy::BlockCachePolicy,
             clock::MonotonicClock,
@@ -1824,12 +1835,9 @@ mod tests {
 
     #[test]
     fn reader_rejects_zero_wal_replay_concurrency() {
-        let options = DbReaderOptions {
-            wal_replay_concurrency: 0,
-            ..DbReaderOptions::default()
-        };
+        let options = DbReaderOptions::default();
         assert!(matches!(
-            DbReader::validate_options(DbReaderMode::ManagedCheckpoint, &options),
+            DbReader::validate_options(DbReaderMode::ManagedCheckpoint, &options, 0),
             Err(SlateDBError::InvalidSSTBatchSize(0))
         ));
     }
@@ -1946,6 +1954,7 @@ mod tests {
             None,
             None,
             DbReaderOptions::default(),
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
             slatedb_common::metrics::MetricsRecorderHelper::noop(),
@@ -2310,6 +2319,7 @@ mod tests {
                 manifest_poll_interval: Duration::from_secs(60 * 60),
                 ..DbReaderOptions::default()
             },
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
             slatedb_common::metrics::MetricsRecorderHelper::noop(),
@@ -2506,6 +2516,7 @@ mod tests {
                 checkpoint_lifetime: Duration::from_millis(1000),
                 ..DbReaderOptions::default()
             },
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             DbReaderMode::ManagedCheckpoint,
             None,
             None,
@@ -2603,6 +2614,7 @@ mod tests {
                 checkpoint_lifetime: Duration::from_millis(1000),
                 ..DbReaderOptions::default()
             },
+            DEFAULT_WAL_REPLAY_CONCURRENCY,
             DbReaderMode::ManagedCheckpoint,
             None,
             None,
@@ -3560,6 +3572,7 @@ mod tests {
                 merge_operator,
                 None,
                 options,
+                DEFAULT_WAL_REPLAY_CONCURRENCY,
                 self.system_clock.clone(),
                 self.rand.clone(),
                 slatedb_common::metrics::MetricsRecorderHelper::noop(),

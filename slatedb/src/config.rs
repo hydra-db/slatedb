@@ -1144,15 +1144,6 @@ pub struct DbReaderOptions {
     /// Defaults to 64MB
     pub max_memtable_bytes: u64,
 
-    /// Maximum number of immutable WAL SSTs opened concurrently while a reader
-    /// is established or refreshed. Raising this reduces cold-reader latency
-    /// for databases with a long uncompacted WAL tail at the cost of additional
-    /// object-store requests and temporary replay memory.
-    ///
-    /// Defaults to 4, preserving the historical replay behavior.
-    #[serde(default = "default_reader_wal_replay_concurrency")]
-    pub wal_replay_concurrency: usize,
-
     /// Options for the local disk cache. If `root_folder` is set, the reader
     /// will wrap its object store in a `CachedObjectStore` backed by the
     /// local filesystem, mirroring the behaviour of `Db`.
@@ -1186,17 +1177,12 @@ impl Default for DbReaderOptions {
             manifest_poll_interval: Duration::from_secs(10),
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             max_memtable_bytes: 64 * 1024 * 1024,
-            wal_replay_concurrency: default_reader_wal_replay_concurrency(),
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
             metric_level: None,
             object_store_max_retries: None,
         }
     }
-}
-
-fn default_reader_wal_replay_concurrency() -> usize {
-    4
 }
 
 /// The compression algorithm to use for SSTables.
