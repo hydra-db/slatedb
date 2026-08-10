@@ -2429,13 +2429,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_db_builder_rejects_low_max_wal_flushes_before_l0_flush() {
+    async fn test_db_builder_rejects_zero_max_wal_flushes_before_l0_flush() {
         let result = crate::Db::builder(
-            "test_db_builder_rejects_low_max_wal_flushes_before_l0_flush",
+            "test_db_builder_rejects_zero_max_wal_flushes_before_l0_flush",
             Arc::new(InMemory::new()),
         )
         .with_settings(Settings {
-            max_wal_flushes_before_l0_flush: 4095,
+            max_wal_flushes_before_l0_flush: 0,
             ..Settings::default()
         })
         .build()
@@ -2449,7 +2449,7 @@ mod tests {
         assert!(matches!(err.kind(), ErrorKind::Invalid));
         assert!(
             err.to_string()
-                .contains("max_wal_flushes_before_l0_flush must be at least 4096"),
+                .contains("max_wal_flushes_before_l0_flush must be at least 1"),
             "unexpected error: {err}"
         );
     }

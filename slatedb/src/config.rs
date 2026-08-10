@@ -768,6 +768,8 @@ pub struct Settings {
     /// This also bounds the amount of WAL data that needs to be replayed on recovery: once
     /// this many WAL flushes have occurred since the last memtable freeze, the active
     /// memtable will be frozen even if it has not reached `l0_sst_size_bytes`.
+    /// Values must be greater than zero. Lower values reduce sparse-workload WAL replay
+    /// fan-in at the cost of producing L0 SSTs and compaction work more frequently.
     pub max_wal_flushes_before_l0_flush: u64,
 
     /// Defines the max total number of SSTs in L0 across the entire key space. Memtables
@@ -913,9 +915,9 @@ impl Settings {
             )
             .into());
         }
-        if self.max_wal_flushes_before_l0_flush < 4096 {
+        if self.max_wal_flushes_before_l0_flush == 0 {
             return Err(SlateDBError::InvalidConfiguration(
-                "max_wal_flushes_before_l0_flush must be at least 4096".into(),
+                "max_wal_flushes_before_l0_flush must be at least 1".into(),
             )
             .into());
         }
@@ -2178,9 +2180,9 @@ object_store_cache_options:
     }
 
     #[test]
-    fn test_validate_rejects_low_max_wal_flushes_before_l0_flush() {
+    fn test_validate_rejects_zero_max_wal_flushes_before_l0_flush() {
         let settings = Settings {
-            max_wal_flushes_before_l0_flush: 4095,
+            max_wal_flushes_before_l0_flush: 0,
             ..Settings::default()
         };
         let err = settings.validate().expect_err("expected invalid settings");

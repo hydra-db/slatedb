@@ -4592,7 +4592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_flushes_memtable_after_max_wal_flushes() {
-        const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 4096;
+        const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 128;
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = "/tmp/test_flush_memtable_max_wal_flushes";
