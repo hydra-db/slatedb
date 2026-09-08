@@ -67,6 +67,7 @@ pub struct DbTransaction {
     /// make `DbTransaction` `!Sync`, which is incompatible with async code using the `DbReadOps`
     /// trait.
     write_batch: RwLock<WriteBatch>,
+    commit_finalizer: Mutex<Option<CommitFinalizer>>,
     /// Reference to the database
     db_inner: Arc<DbInner>,
     /// Isolation level for this transaction
@@ -76,6 +77,8 @@ pub struct DbTransaction {
     /// Keys that should be excluded from write conflict detection when committing.
     untracked_write_keys: RwLock<HashSet<Bytes>>,
 }
+
+type CommitFinalizer = Box<dyn FnOnce(u64, &mut WriteBatch) -> Result<(), crate::Error> + Send>;
 
 impl DbTransaction {
     #[allow(unused)]
@@ -91,6 +94,7 @@ impl DbTransaction {
             started_seq: seq,
             txn_manager,
             write_batch: RwLock::new(WriteBatch::new()),
+            commit_finalizer: Mutex::new(None),
             db_inner,
             isolation_level,
             range_trackers: Mutex::new(Vec::new()),
@@ -605,8 +609,10 @@ impl DbTransaction {
                 .filter(|key| !untracked_write_keys.contains(key))
                 .collect()
         };
-        self.txn_manager
-            .track_write_keys(&self.txn_id, &tracked_write_keys);
+        if self.commit_finalizer.lock().is_none() {
+            self.txn_manager
+                .track_write_keys(&self.txn_id, &tracked_write_keys);
+        }
 
         // Submit the WriteBatch to the database for processing. The batch is sent to a
         // dedicated background task (in batch_write.rs) that processes all WriteBatches
@@ -618,6 +624,55 @@ impl DbTransaction {
             .await
             .map(Some)
             .map_err(Into::into)
+    }
+
+    /// Finalize a non-empty transaction at its storage-assigned commit sequence.
+    /// The synchronous callback runs exactly once in the serialized writer, after
+    /// allocation and before conflict validation or publication. It must do bounded
+    /// CPU work only, without I/O or reentry into this database. Read dependencies
+    /// retain the original snapshot; all finalized write keys participate in OCC.
+    /// An error or an empty finalized batch publishes nothing; sequence gaps are valid.
+    /// Cancellation after enqueue does not cancel finalization or acceptance.
+    pub async fn commit_with_finalizer<F>(
+        self,
+        options: &WriteOptions,
+        finalizer: F,
+    ) -> Result<Option<WriteHandle>, crate::Error>
+    where
+        F: FnOnce(u64, &mut WriteBatch) -> Result<(), crate::Error> + Send + 'static,
+    {
+        if options.seqnum != 0 || self.write_batch.read().is_empty() {
+            return Err(crate::Error::invalid(
+                "finalization requires a non-empty batch and storage-assigned sequence".into(),
+            ));
+        }
+        *self.commit_finalizer.lock() = Some(Box::new(finalizer));
+        self.commit_with_options(options).await
+    }
+
+    /// Conservative serialized batch size, excluding caller-owned preparation.
+    pub fn write_batch_size(&self) -> usize {
+        self.write_batch.read().estimated_size()
+    }
+
+    pub(crate) fn finalize_commit(
+        &self,
+        sequence: u64,
+        batch: &mut WriteBatch,
+    ) -> Result<(), SlateDBError> {
+        if let Some(finalizer) = self.commit_finalizer.lock().take() {
+            finalizer(sequence, batch).map_err(|e| {
+                SlateDBError::InvalidConfiguration(format!("commit finalization: {e}"))
+            })?;
+            if batch.is_empty() {
+                return Err(SlateDBError::EmptyBatch);
+            }
+            // Register the FINAL keys, never the preparation placeholders. Do not
+            // permit unmark_write to exempt keys introduced by a finalizer.
+            self.txn_manager
+                .track_write_keys(&self.txn_id, &batch.keys());
+        }
+        Ok(())
     }
 
     /// Rollback the transaction by discarding all buffered operations.
@@ -2193,5 +2248,170 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod sequence_finalization_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    fn options() -> WriteOptions {
+        WriteOptions::default()
+    }
+
+    #[tokio::test]
+    async fn finalization_survives_occ_holes_and_disjoint_overtaking() {
+        let db = crate::Db::open("finalization/gap", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        db.put(b"hot", b"one").await.unwrap();
+        let stale = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        stale.get(b"hot").await.unwrap();
+        stale.put(b"lost", b"no").unwrap();
+        db.put(b"hot", b"two").await.unwrap();
+        assert_eq!(
+            stale.commit().await.unwrap_err().kind(),
+            crate::ErrorKind::Transaction
+        );
+        let a = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let b = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let snapshot = a.seqnum();
+        assert_eq!(snapshot, b.seqnum());
+        for (txn, tag) in [(a, "a"), (b, "b")] {
+            txn.put(b"placeholder", b"pending").unwrap();
+            let handle = txn
+                .commit_with_finalizer(&options(), move |c, batch| {
+                    batch.try_map_puts(|_, _| {
+                        Ok((
+                            Bytes::from(format!("{tag}/{c}")),
+                            Bytes::copy_from_slice(&c.to_be_bytes()),
+                        ))
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let c = handle.seqnum();
+            assert!(c > snapshot + 1);
+            assert_eq!(
+                db.get(format!("{tag}/{c}"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                c.to_be_bytes()
+            );
+        }
+        assert!(db.get(b"placeholder").await.unwrap().is_none());
+        assert!(db.get(b"lost").await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalization_registers_new_keys_for_point_and_range_conflicts() {
+        let db = crate::Db::open("finalization/dependencies", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        let reader = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let point = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        point.get(b"new/key").await.unwrap();
+        let mut scan = reader.scan_prefix(b"new/", ..).await.unwrap();
+        assert!(scan.next().await.unwrap().is_none());
+        drop(scan);
+        let writer = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        writer.put(b"placeholder", b"pending").unwrap();
+        writer
+            .commit_with_finalizer(&options(), |_, batch| {
+                batch.try_map_puts(|_, v| Ok((Bytes::from_static(b"new/key"), v)))
+            })
+            .await
+            .unwrap();
+        for txn in [reader, point] {
+            txn.put(b"must-not-appear", b"bad").unwrap();
+            assert_eq!(
+                txn.commit().await.unwrap_err().kind(),
+                crate::ErrorKind::Transaction
+            );
+        }
+        // A stale finalizer must also conflict with an already committed final key.
+        let stale = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        stale.put(b"another-placeholder", b"bad").unwrap();
+        db.put(b"new/key", b"winner").await.unwrap();
+        let error = stale
+            .commit_with_finalizer(&options(), |_, batch| {
+                batch.try_map_puts(|_, v| Ok((Bytes::from_static(b"new/key"), v)))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Transaction);
+        assert_eq!(db.get(b"new/key").await.unwrap().unwrap(), "winner");
+        assert!(db.get(b"must-not-appear").await.unwrap().is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalization_error_empty_and_collision_publish_nothing() {
+        let db = crate::Db::open("finalization/failure", Arc::new(InMemory::new()))
+            .await
+            .unwrap();
+        for mode in 0..3 {
+            let txn = db
+                .begin(IsolationLevel::SerializableSnapshot)
+                .await
+                .unwrap();
+            txn.put(b"a", b"one").unwrap();
+            txn.put(b"b", b"two").unwrap();
+            assert!(txn
+                .commit_with_finalizer(&options(), move |_, batch| {
+                    match mode {
+                        0 => Err(crate::Error::invalid("injected".into())),
+                        1 => {
+                            *batch = WriteBatch::new();
+                            Ok(())
+                        }
+                        _ => batch.try_map_puts(|_, v| Ok((Bytes::from_static(b"collision"), v))),
+                    }
+                })
+                .await
+                .is_err());
+            assert_eq!(db.status().durable_seq, 0);
+        }
+        for key in [b"a".as_slice(), b"b", b"collision"] {
+            assert!(db.get(key).await.unwrap().is_none());
+        }
+        let txn = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        assert!(txn
+            .commit_with_finalizer(&options(), |_, _| Ok(()))
+            .await
+            .is_err());
+        let handle = db.put(b"live", b"ok").await.unwrap();
+        assert!(handle.seqnum() >= 4);
+        db.close().await.unwrap();
     }
 }

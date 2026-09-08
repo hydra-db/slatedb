@@ -191,7 +191,7 @@ impl DbInner {
     #[instrument(level = "trace", skip_all, fields(batch_size = batch.op_count()))]
     async fn write_batch<'a>(
         &'a self,
-        batch: WriteBatch,
+        mut batch: WriteBatch,
         options: &WriteOptions,
         txn: Option<&DbTransaction>,
         mut wal_writer: Option<&mut (dyn WalWriter + 'static)>,
@@ -222,6 +222,9 @@ impl DbInner {
         // Check for transaction conflicts before proceeding with the write batch
         // if this batch is part of a transaction.
         if let Some(txn) = txn {
+            if let Err(error) = txn.finalize_commit(commit_seq, &mut batch) {
+                return Ok(Err(error));
+            }
             if self.txn_manager.check_has_conflict(&txn.id()) {
                 return Ok(Err(SlateDBError::TransactionConflict));
             }
