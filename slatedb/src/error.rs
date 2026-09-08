@@ -16,6 +16,8 @@ use slatedb_txn_obj::TransactionalObjectError;
 #[non_exhaustive]
 #[derive(Clone, Debug, ThisError)]
 pub(crate) enum SlateDBError {
+    #[error("commit finalization failed: {0}")]
+    CommitFinalization(String),
     #[error("io error")]
     IoError(#[from] Arc<std::io::Error>),
 
@@ -717,6 +719,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidEnvironmentVariable { .. } => Error::invalid(msg),
             SlateDBError::InvalidSequenceNumber { .. } => Error::invalid(msg),
             SlateDBError::EmptyBatch => Error::invalid(msg),
+            SlateDBError::CommitFinalization(_) => Error::invalid(msg),
 
             // Data errors
             SlateDBError::InvalidFlatbuffer(err) => Error::data(msg).with_source(Box::new(err)),

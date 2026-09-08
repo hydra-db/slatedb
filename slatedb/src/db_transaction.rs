@@ -661,9 +661,8 @@ impl DbTransaction {
         batch: &mut WriteBatch,
     ) -> Result<(), SlateDBError> {
         if let Some(finalizer) = self.commit_finalizer.lock().take() {
-            finalizer(sequence, batch).map_err(|e| {
-                SlateDBError::InvalidConfiguration(format!("commit finalization: {e}"))
-            })?;
+            finalizer(sequence, batch)
+                .map_err(|e| SlateDBError::CommitFinalization(e.to_string()))?;
             if batch.is_empty() {
                 return Err(SlateDBError::EmptyBatch);
             }
