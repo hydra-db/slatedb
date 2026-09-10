@@ -1,4 +1,8 @@
 use async_trait::async_trait;
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+
+// Bound cold SST opening while retaining the existing merge order.
+const MAX_MERGE_INIT_CONCURRENCY: usize = 16;
 
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator, TrackedRowEntryIterator};
@@ -124,15 +128,27 @@ impl<'a> MergeIterator<'a> {
             return Ok(());
         }
 
-        for (index, mut iterator) in self.pending_iterators.drain(..) {
-            iterator.init().await?;
-            if let Some(next_kv) = iterator.next().await? {
-                self.iterators.push(Reverse(MergeIteratorHeapEntry {
-                    next_kv,
-                    index,
-                    iterator,
-                    order: self.order,
-                }));
+        let order = self.order;
+        let mut initialized = stream::iter(self.pending_iterators.drain(..))
+            .map(|(index, mut iterator)| {
+                async move {
+                    iterator.init().await?;
+                    Ok::<_, SlateDBError>(iterator.next().await?.map(|next_kv| {
+                        Reverse(MergeIteratorHeapEntry {
+                            next_kv,
+                            index,
+                            iterator,
+                            order,
+                        })
+                    }))
+                }
+                .boxed()
+            })
+            .buffered(MAX_MERGE_INIT_CONCURRENCY)
+            .boxed();
+        while let Some(entry) = initialized.try_next().await? {
+            if let Some(entry) = entry {
+                self.iterators.push(entry);
             }
         }
         self.current = self.iterators.pop().map(|r| r.0);
@@ -241,12 +257,81 @@ impl TrackedRowEntryIterator for MergeIterator<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::SlateDBError;
     use crate::iter::{IterationOrder, RowEntryIterator};
-    use crate::merge_iterator::MergeIterator;
+    use crate::merge_iterator::{MergeIterator, MAX_MERGE_INIT_CONCURRENCY};
     use crate::test_utils::{assert_iterator, assert_next, TestIterator};
     use crate::types::RowEntry;
     use std::collections::VecDeque;
     use std::vec;
+
+    struct GatedIterator {
+        inner: TestIterator,
+        started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        gate: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl RowEntryIterator for GatedIterator {
+        async fn init(&mut self) -> Result<(), SlateDBError> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.acquire().await.unwrap().forget();
+            self.inner.init().await
+        }
+        async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+            self.inner.next().await
+        }
+        async fn seek(&mut self, key: &[u8]) -> Result<(), SlateDBError> {
+            self.inner.seek(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cold_initialization_overlaps_with_bounded_admission() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let started = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let iters = (0..32).rev().map(|i| GatedIterator {
+            inner: TestIterator::new().with_row_entry(RowEntry::new_value(
+                format!("{i:03}").as_bytes(),
+                b"value",
+                1,
+            )),
+            started: Arc::clone(&started),
+            gate: Arc::clone(&gate),
+        });
+        let mut merge = MergeIterator::new(iters).unwrap();
+        let mut first = Box::pin(async {
+            merge.init().await?;
+            merge.next().await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut first => panic!("returned before releasing storage: {result:?}"),
+                _ = async {
+                    while started.load(Ordering::SeqCst) < MAX_MERGE_INIT_CONCURRENCY {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), MAX_MERGE_INIT_CONCURRENCY);
+        gate.add_permits(32);
+        assert_eq!(first.await.unwrap().unwrap().key.as_ref(), b"000");
+        for i in 1..32 {
+            assert_eq!(
+                merge.next().await.unwrap().unwrap().key.as_ref(),
+                format!("{i:03}").as_bytes()
+            );
+        }
+        assert!(merge.next().await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn test_merge_iterator_should_include_entries_in_order() {

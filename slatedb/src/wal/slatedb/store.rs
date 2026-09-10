@@ -491,8 +491,8 @@ impl WalTableStore {
     ///   1. Parallel exponential probe at offsets `2^0, 2^1, ..., 2^k` from
     ///      `start_after`. One RTT per round of 8 exponents. Brackets the
     ///      frontier between two adjacent powers of two.
-    ///   2. Sequential binary search inside the bracketed range to find the
-    ///      exact frontier.
+    ///   2. Parallel search with up to eight probes per round inside the
+    ///      bracketed range to find the exact frontier.
     ///
     /// Relies on the fencing protocol's contiguity invariant: "id exists" is
     /// monotone-decreasing in id, so binary search is sound. Total HEAD count
@@ -543,19 +543,29 @@ impl WalTableStore {
             return Ok(start_after);
         };
 
+        // Search the bracket with up to ROUND_SIZE evenly spaced probes per round. Keep the
+        // highest hit and the first miss, as in the exponential phase. This cuts sequential
+        // object-store round trips and keeps the contiguity assumption.
         let mut left = lo + 1;
         let mut right = hi;
         while left < right {
-            let mid = left + (right - left) / 2;
-            if wal_object_exists(
-                &self.object_store,
-                &self.path(WalFileId::from(start_after.value() + mid)),
-            )
-            .await?
-            {
-                left = mid + 1;
-            } else {
-                right = mid;
+            let width = right - left;
+            let count = width.min(u64::from(ROUND_SIZE));
+            let offsets = (0..count)
+                .map(|i| left + i * width / count)
+                .collect::<Vec<_>>();
+            let probes = offsets.iter().map(|&offset| {
+                let path = self.path(WalFileId::from(start_after.value() + offset));
+                let object_store = Arc::clone(&self.object_store);
+                async move { wal_object_exists(&object_store, &path).await }
+            });
+            for (offset, result) in offsets.iter().zip(join_all(probes).await) {
+                if result? {
+                    left = offset + 1;
+                } else {
+                    right = *offset;
+                    break;
+                }
             }
         }
         Ok(WalFileId::from(start_after.value() + left - 1))
