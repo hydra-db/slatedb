@@ -101,8 +101,8 @@ impl TableStore {
     ///   1. Parallel exponential probe at offsets `2^0, 2^1, ..., 2^k` from
     ///      `start_after`. One RTT per round of 8 exponents. Brackets the
     ///      frontier between two adjacent powers of two.
-    ///   2. Sequential binary search inside the bracketed range to find the
-    ///      exact frontier.
+    ///   2. Parallel search with up to eight probes per round inside the
+    ///      bracketed range to find the exact frontier.
     ///
     /// Relies on the fencing protocol's contiguity invariant: "id exists" is
     /// monotone-decreasing in id, so binary search is sound. Total HEAD count
@@ -176,26 +176,30 @@ impl TableStore {
             Some(o) => o,
         };
 
-        // ---- Phase 2: binary search the open interval (lo, hi). ----
-        //
-        // Invariants entering the loop:
-        //   * offset = lo  exists       (highest from Phase 1)
-        //   * offset = hi  does not     (first miss from Phase 1)
-        // So the largest existing offset lives in [lo, hi - 1]. Search
-        // strictly above lo (left = lo + 1) so we never re-probe a slot
-        // whose state we already know.
+        // ---- Phase 2: bounded parallel search inside the bracket. ----
+        // Every round probes up to eight evenly spaced offsets. Keep the
+        // highest hit and first miss, exactly as for exponential probing.
+        // This reduces sequential object-store round trips without changing
+        // the contiguity assumption or the fence's final conditional PUT.
         let mut left = lo + 1;
         let mut right = hi;
         while left < right {
-            let mid = left + (right - left) / 2;
-            let path = self.path(&SsTableId::Wal(start_after + mid));
-            if wal_object_exists(object_store, &path).await? {
-                // `mid` exists, so the answer is mid or higher; discard
-                // everything at-or-below mid.
-                left = mid + 1;
-            } else {
-                // `mid` is missing, so the answer is strictly below mid.
-                right = mid;
+            let width = right - left;
+            let count = width.min(u64::from(ROUND_SIZE));
+            let offsets = (0..count)
+                .map(|i| left + i * width / count)
+                .collect::<Vec<_>>();
+            let probes = offsets.iter().map(|&offset| {
+                let path = self.path(&SsTableId::Wal(start_after + offset));
+                async move { wal_object_exists(object_store, &path).await }
+            });
+            for (offset, result) in offsets.iter().zip(join_all(probes).await) {
+                if result? {
+                    left = offset + 1;
+                } else {
+                    right = *offset;
+                    break;
+                }
             }
         }
 
@@ -2693,7 +2697,7 @@ mod tests {
     //   - ROUND_SIZE=8 -> first round probes offsets 1, 2, 4, ..., 128
     //   - 2nd round starts at offset 256
     // The (8, 16, 128, 256) cluster pins answers at probe offsets; the
-    // surrounding values (7/9, 127/129, 255/257) pin binary search inside
+    // surrounding values (7/9, 127/129, 255/257) pin the frontier search inside
     // each round. start_after=100 with stale ids 1..=100 also catches
     // regressions where the start_after offset is dropped from the probe path.
     #[rstest]

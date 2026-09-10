@@ -2761,9 +2761,13 @@ mod tests {
         .await
         .unwrap();
 
+        // The poller has an immediate initial tick even with a long interval.
+        // Pin its predecessor so that tick cannot race the pre-refresh assertion.
+        let snapshot = reader.snapshot().await.unwrap();
         db.put(b"key", b"value").await.unwrap();
         assert_eq!(reader.get(b"key").await.unwrap(), None);
 
+        drop(snapshot);
         reader.refresh().await.unwrap();
         assert_eq!(
             reader.get(b"key").await.unwrap(),
