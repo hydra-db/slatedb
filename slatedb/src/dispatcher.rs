@@ -280,6 +280,11 @@ impl<T: Send + std::fmt::Debug> MessageDispatcher<T> {
     /// A [Result] containing `Ok(())` on clean shutdown, or an error if the handler
     /// fails for any reason.
     async fn run(&mut self) -> Result<(), SlateDBError> {
+        tokio::select! {
+            biased;
+            _ = self.cancellation_token.cancelled() => return Ok(()),
+            result = self.handler.initialize() => result?,
+        }
         let mut tickers = self
             .handler
             .tickers()
@@ -458,6 +463,12 @@ impl<'a, T: Send> MessageDispatcherTicker<'a, T> {
 /// [MessageHandlerExecutor] will handle them appropriately.
 #[async_trait]
 pub(crate) trait MessageHandler<T: Send>: Send {
+    /// Initialize before tickers and messages start. Shutdown may cancel this
+    /// future; cleanup must also accept a partially initialized handler.
+    async fn initialize(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
     /// Defines message ticker schedules. [MessageDispatcher::run] instantiates a
     /// [MessageDispatcherTicker] for each ticker defined here. Whenever each ticker
     /// ticks, the message factory generates a message, and [MessageDispatcher] sends the
