@@ -62,6 +62,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use fail_parallel::FailPointRegistry;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -524,6 +525,61 @@ pub(crate) struct CompactorEventHandler {
     /// Cached handles for per-worker `worker_last_heartbeat_ms` gauges. Handles are
     /// retained for every worker id observed by this coordinator process.
     worker_heartbeat_gauges: HashMap<String, Arc<dyn GaugeFn>>,
+}
+
+/// Keeps startup in the executor's cancellation/error lifecycle. No detached
+/// task can outlive the database or hide a failed compactor initialization.
+pub(crate) struct DeferredCompactorHandler {
+    initialization: Option<BoxFuture<'static, Result<CompactorEventHandler, SlateDBError>>>,
+    handler: Option<CompactorEventHandler>,
+}
+
+impl DeferredCompactorHandler {
+    pub(crate) fn new(
+        initialization: BoxFuture<'static, Result<CompactorEventHandler, SlateDBError>>,
+    ) -> Self {
+        Self {
+            initialization: Some(initialization),
+            handler: None,
+        }
+    }
+}
+
+#[async_trait]
+impl MessageHandler<CompactorMessage> for DeferredCompactorHandler {
+    async fn initialize(&mut self) -> Result<(), SlateDBError> {
+        if let Some(initialization) = self.initialization.take() {
+            self.handler = Some(initialization.await?);
+        }
+        Ok(())
+    }
+
+    fn tickers(&mut self) -> Vec<MessageTickerDef<CompactorMessage>> {
+        self.handler
+            .as_mut()
+            .expect("initialized before tickers")
+            .tickers()
+    }
+
+    async fn handle(&mut self, message: CompactorMessage) -> Result<(), SlateDBError> {
+        self.handler
+            .as_mut()
+            .expect("initialized before messages")
+            .handle(message)
+            .await
+    }
+
+    async fn cleanup(
+        &mut self,
+        messages: BoxStream<'async_trait, CompactorMessage>,
+        result: Result<(), SlateDBError>,
+    ) -> Result<(), SlateDBError> {
+        self.initialization = None;
+        match self.handler.as_mut() {
+            Some(handler) => handler.cleanup(messages, result).await,
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]

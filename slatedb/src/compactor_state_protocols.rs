@@ -145,6 +145,7 @@ impl CompactorStateWriter {
         let dirty_manifest = manifest.prepare_dirty()?;
         let dirty_compactions = loop {
             let mut dirty_compactions = compactions.prepare_dirty()?;
+            let persisted_value = dirty_compactions.value.clone();
             // Reset unclaimed scheduled compactions back to submitted on restart.
             // Scheduled compactions have no worker yet, so they always reset.
             // Stale Running compactions are left alone here: reclaim_stale_workers
@@ -157,6 +158,13 @@ impl CompactorStateWriter {
                 }
             });
             dirty_compactions.value.retain_active_and_last_finished();
+            // Fencing already persisted the new epoch. An unchanged restart
+            // needs no second object PUT (and its GC-boundary read) before the
+            // database can serve writes. Changed recovery work still uses the
+            // conditional update and conflict retry below.
+            if dirty_compactions.value == persisted_value {
+                break dirty_compactions;
+            }
             match compactions.update(dirty_compactions.clone()).await {
                 Ok(()) => break dirty_compactions,
                 Err(err) if err.is_sequenced_write_conflict() => {
@@ -495,6 +503,10 @@ mod tests {
         StoredCompactions::create(compactions_store.clone(), 7)
             .await
             .unwrap();
+        let before_id = StoredCompactions::load(compactions_store.clone())
+            .await
+            .unwrap()
+            .id();
 
         let options = CompactorOptions::default();
         let rand = Arc::new(DbRand::new(7));
@@ -512,6 +524,14 @@ mod tests {
         let manifest = manifest_store.read_latest_manifest().await.unwrap();
         let compactions = compactions_store.read_latest_compactions().await.unwrap();
         assert_eq!(manifest.manifest.compactor_epoch, 9);
+        assert_eq!(
+            StoredCompactions::load(compactions_store.clone())
+                .await
+                .unwrap()
+                .id(),
+            before_id + 1,
+            "an unchanged restart should persist only the epoch fence"
+        );
         assert_eq!(
             manifest.manifest.compactor_epoch,
             compactions.compactions.compactor_epoch

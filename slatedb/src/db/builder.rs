@@ -127,11 +127,11 @@ use crate::compaction_worker::{
 };
 use crate::compactions_store::CompactionsStore;
 use crate::compactor::stats::CompactionStats;
-use crate::compactor::CompactorEventHandler;
 use crate::compactor::CompactorMessage;
 use crate::compactor::SizeTieredCompactionSchedulerSupplier;
 use crate::compactor::COMPACTOR_TASK_NAME;
 use crate::compactor::{CompactionSchedulerSupplier, Compactor};
+use crate::compactor::{CompactorEventHandler, DeferredCompactorHandler};
 use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
 use crate::config::{CompactionWorkerOptions, CompactorOptions};
@@ -142,7 +142,7 @@ use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheWrapper, UnownedDbCache};
 use crate::db_reader::{DbReader, DbReaderMode, DEFAULT_WAL_REPLAY_CONCURRENCY};
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
-use crate::dispatcher::MessageHandlerExecutor;
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor};
 use crate::error::SlateDBError;
 use crate::fence::{WriterFenceResult, WriterFencer};
 use crate::filter_policy::{BloomFilterPolicy, FilterPolicy};
@@ -188,6 +188,7 @@ pub struct DbBuilder<P: Into<Path>> {
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
     compactor_builder: Option<CompactorBuilder<Path>>,
+    defer_compactor_startup: bool,
     gc_builder: Option<GarbageCollectorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
     seed: Option<u64>,
@@ -218,6 +219,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock: None,
             gc_runtime: None,
             compactor_builder: None,
+            defer_compactor_startup: false,
             gc_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
             seed: None,
@@ -326,6 +328,17 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// configuration.
     pub fn with_compactor_builder(mut self, compactor_builder: CompactorBuilder<P>) -> Self {
         self.compactor_builder = Some(compactor_builder.into_path_builder());
+        self
+    }
+
+    /// Start the embedded compactor in the background after writer fencing.
+    /// WAL replay and durable write acknowledgments are unchanged. When enabled,
+    /// compactor initialization failures close the database through its normal
+    /// background-error lifecycle instead of necessarily failing `build`.
+    /// Closing the database cancels unfinished compactor initialization.
+    /// Disabled by default to preserve synchronous startup error reporting.
+    pub fn with_deferred_compactor_startup(mut self, enabled: bool) -> Self {
+        self.defer_compactor_startup = enabled;
         self
     }
 
@@ -764,11 +777,12 @@ impl<P: Into<Path>> DbBuilder<P> {
                     compactor_table_store,
                     manifest_store.clone(),
                     compactions_store.clone(),
+                    self.defer_compactor_startup,
                 )
                 .await?;
             task_executor.add_handler(
                 COMPACTOR_TASK_NAME.to_string(),
-                Box::new(compactor_handlers.handler),
+                compactor_handlers.handler,
                 compactor_handlers.rx,
                 &tokio_handle,
             )?;
@@ -1154,7 +1168,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
 /// with the task executor in `DbBuilder::build`.
 pub(crate) struct CompactorHandlers {
     /// The coordinator event handler.
-    pub(crate) handler: CompactorEventHandler,
+    pub(crate) handler: Box<dyn MessageHandler<CompactorMessage>>,
     /// Receiver for the coordinator's messages.
     pub(crate) rx: async_channel::Receiver<CompactorMessage>,
     /// The embedded worker handler and its receiver, present when
@@ -1395,6 +1409,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         table_store: Arc<TableStore>,
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
+        defer_startup: bool,
     ) -> Result<CompactorHandlers, SlateDBError> {
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
@@ -1407,7 +1422,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         let (_tx, rx) = async_channel::unbounded();
         let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&options));
         let stats = Arc::new(CompactionStats::new(&recorder));
-        let handler = CompactorEventHandler::new(
+        let initialization = CompactorEventHandler::new(
             manifest_store.clone(),
             compactions_store.clone(),
             options.clone(),
@@ -1416,8 +1431,12 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             stats.clone(),
             self.system_clock.clone(),
             recorder.clone(),
-        )
-        .await?;
+        );
+        let handler: Box<dyn MessageHandler<CompactorMessage>> = if defer_startup {
+            Box::new(DeferredCompactorHandler::new(Box::pin(initialization)))
+        } else {
+            Box::new(initialization.await?)
+        };
         let worker = options.worker.clone().map(|worker_options| {
             CompactionWorkerHandler::build_worker_handler(
                 manifest_store,
@@ -2263,6 +2282,7 @@ mod tests {
     use crate::cached_object_store::CachedObjectStore;
     use crate::compactions_store::{CompactionsStore, StoredCompactions};
     use crate::config::{CompactorOptions, GarbageCollectorOptions, MetricLevel, Settings};
+    use crate::db_status::ClosedResultWriter;
     use crate::error::ErrorKind;
     use crate::garbage_collector::stats::GC_COUNT;
     use crate::instrumented_object_store::stats::REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT;
@@ -2400,6 +2420,163 @@ mod tests {
         );
 
         db.close().await.expect("failed to close db");
+    }
+
+    async fn deferred_compactor_fixture() -> (
+        crate::Db,
+        Arc<crate::test_utils::GatedObjectStore>,
+        Arc<dyn ObjectStore>,
+    ) {
+        use crate::test_utils::GatedObjectStore;
+        let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = Path::from("deferred-compactor");
+        StoredManifest::create_new_db(
+            Arc::new(ManifestStore::new(&root, raw.clone())),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        StoredCompactions::create(Arc::new(CompactionsStore::new(&root, raw.clone())), 0)
+            .await
+            .unwrap();
+        let mut gated = GatedObjectStore::new(raw.clone());
+        gated.get_opts_path_filter = Some("/compactions/".to_string());
+        gated.get_opts_gate.close();
+        let gated = Arc::new(gated);
+        let db = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::Db::builder(root, gated.clone())
+                .with_settings(Settings {
+                    garbage_collector_options: None,
+                    object_store_max_retries: Some(0),
+                    compactor_options: Some(CompactorOptions {
+                        worker: None,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .with_deferred_compactor_startup(true)
+                .build(),
+        )
+        .await
+        .expect("compactor I/O must not block writer open")
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            gated.get_opts_gate.wait_for_arrivals(1),
+        )
+        .await
+        .expect("compactor initialization must actually start");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            db.put(b"key", b"durable"),
+        )
+        .await
+        .expect("compactor I/O must not block durable writes")
+        .unwrap();
+        (db, gated, raw)
+    }
+
+    #[tokio::test]
+    async fn test_deferred_compactor_close_cancels_initialization_and_preserves_wal() {
+        let (db, _gated, raw) = deferred_compactor_fixture().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), db.close())
+            .await
+            .expect("close must cancel stalled initialization")
+            .unwrap();
+        let reopened = crate::Db::builder("deferred-compactor", raw)
+            .with_settings(Settings {
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(b"key").await.unwrap().unwrap().as_ref(),
+            b"durable"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deferred_compactor_resumes_after_storage_unblocks() {
+        let (db, gated, raw) = deferred_compactor_fixture().await;
+        gated.get_opts_gate.release();
+        let compactions = Arc::new(CompactionsStore::new(
+            &Path::from("deferred-compactor"),
+            raw,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if StoredCompactions::load(compactions.clone())
+                    .await
+                    .unwrap()
+                    .compactions()
+                    .compactor_epoch
+                    > 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compactor must finish fencing after release");
+        db.put(b"after", b"ready").await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deferred_compactor_does_not_allow_stale_writer_acknowledgments() {
+        let (old, _gated, raw) = deferred_compactor_fixture().await;
+        let replacement = crate::Db::builder("deferred-compactor", raw)
+            .with_settings(Settings {
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            old.put(b"stale", b"value")
+        )
+        .await
+        .expect("stale writer must fail promptly")
+        .is_err());
+        assert!(replacement.get(b"stale").await.unwrap().is_none());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), old.close())
+            .await
+            .expect("fenced database must cancel compactor startup");
+        replacement.put(b"new", b"value").await.unwrap();
+        replacement.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deferred_compactor_initialization_failure_closes_database() {
+        let (db, gated, _raw) = deferred_compactor_fixture().await;
+        gated
+            .get_opts_gate
+            .set_error(|| object_store::Error::Generic {
+                store: "deferred-compactor-test",
+                source: Box::new(std::io::Error::other("compactor startup failed")),
+            });
+        gated.get_opts_gate.release();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while db.inner.status_manager.result_reader().read().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup error must reach database lifecycle");
+        assert!(db.put(b"after", b"error").await.is_err());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), db.close())
+            .await
+            .expect("failed initialization must remain closable");
     }
 
     #[tokio::test]

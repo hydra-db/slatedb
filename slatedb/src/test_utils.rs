@@ -1135,6 +1135,8 @@ impl Gate {
 #[derive(Debug)]
 pub(crate) struct GatedObjectStore {
     inner: Arc<dyn ObjectStore>,
+    /// If set, apply the GET gate only to paths containing this substring.
+    pub(crate) get_opts_path_filter: Option<String>,
     pub(crate) get_opts_gate: Gate,
     pub(crate) head_gate: Gate,
     pub(crate) put_opts_gate: Gate,
@@ -1151,6 +1153,7 @@ impl GatedObjectStore {
     pub(crate) fn new(inner: Arc<dyn ObjectStore>) -> Self {
         Self {
             inner,
+            get_opts_path_filter: None,
             get_opts_gate: Gate::default(),
             head_gate: Gate::default(),
             put_opts_gate: Gate::default(),
@@ -1177,7 +1180,11 @@ impl ObjectStore for GatedObjectStore {
     ) -> object_store::Result<GetResult> {
         if options.head {
             self.head_gate.wait().await?;
-        } else {
+        } else if self
+            .get_opts_path_filter
+            .as_ref()
+            .is_none_or(|filter| location.as_ref().contains(filter))
+        {
             self.get_opts_gate.wait().await?;
         }
         self.inner.get_opts(location, options).await
