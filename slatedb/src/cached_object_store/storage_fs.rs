@@ -757,20 +757,12 @@ impl FsCacheEvictor {
         // an eviction or rescan already holding the inner tracking lock.
         pending_reads.lock().remove(&path);
 
-        // Reads and deletes use independent queues, so a later delete may be
-        // selected before this read. Do not recreate size and LRU accounting
-        // for a cache file that the delete already removed.
-        match path.try_exists() {
-            Ok(true) => {
-                inner
-                    .track_entry_accessed(path, bytes, system_clock.now(), false)
-                    .await;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!("evictor failed to check a read cache entry [path={path:?}, error={error}]")
-            }
-        }
+        // Reads and deletes use independent queues. Check existence while
+        // holding the same lock used by deletion and eviction, so a reordered
+        // read cannot recreate accounting after a racy pre-lock check.
+        inner
+            .track_existing_entry_accessed(path, bytes, system_clock.now())
+            .await;
     }
 
     async fn background_scan(
@@ -993,7 +985,42 @@ impl FsCacheEvictorInner {
         accessed_time: DateTime<Utc>,
         evict: bool,
     ) -> usize {
+        self.track_entry_accessed_inner(path, bytes, accessed_time, evict, false)
+            .await
+    }
+
+    async fn track_existing_entry_accessed(
+        &self,
+        path: std::path::PathBuf,
+        bytes: usize,
+        accessed_time: DateTime<Utc>,
+    ) -> usize {
+        self.track_entry_accessed_inner(path, bytes, accessed_time, false, true)
+            .await
+    }
+
+    async fn track_entry_accessed_inner(
+        &self,
+        path: std::path::PathBuf,
+        bytes: usize,
+        accessed_time: DateTime<Utc>,
+        evict: bool,
+        require_existing_file: bool,
+    ) -> usize {
         let _track_guard = self.track_lock.lock().await;
+
+        if require_existing_file {
+            match path.try_exists() {
+                Ok(true) => {}
+                Ok(false) => return 0,
+                Err(error) => {
+                    warn!(
+                        "evictor failed to check a read cache entry [path={path:?}, error={error}]"
+                    );
+                    return 0;
+                }
+            }
+        }
 
         let entry_count = {
             let mut cache_state = self.cache_state.lock().await;
@@ -1130,12 +1157,12 @@ impl FsCacheEvictorInner {
     }
 
     async fn delete_entry(&self, path: std::path::PathBuf) {
+        // Serialize physical deletion with read existence checks and accounting.
+        let _track_guard = self.track_lock.lock().await;
         let deleted_entries = delete_cache_entry(path, self.file_handle_cache.clone()).await;
         if deleted_entries.is_empty() {
             return;
         }
-
-        let _track_guard = self.track_lock.lock().await;
 
         // Untrack the deleted entries.
         let entry_count = {
@@ -1491,6 +1518,47 @@ mod tests {
         .await;
 
         assert!(pending_reads.lock().is_empty());
+        assert!(inner.cache_state.lock().await.entries.is_empty());
+        assert_eq!(inner.cache_size_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_evictor_checks_read_existence_after_waiting_for_tracking_lock() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_read_delete_race_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let inner = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        let path = gen_rand_file(temp_dir.path(), "deleted-while-waiting", 16);
+        let pending_reads = Arc::new(SyncMutex::new(HashSet::from([path.clone()])));
+        let track_guard = inner.track_lock.lock().await;
+
+        let process = tokio::spawn(FsCacheEvictor::process_read(
+            inner.clone(),
+            pending_reads.clone(),
+            path.clone(),
+            16,
+            Arc::new(DefaultSystemClock::new()),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pending_reads.lock().contains(&path) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        drop(track_guard);
+        process.await.unwrap();
+
         assert!(inner.cache_state.lock().await.entries.is_empty());
         assert_eq!(inner.cache_size_bytes.load(Ordering::Acquire), 0);
     }
