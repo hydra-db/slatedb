@@ -666,31 +666,82 @@ impl FsCacheEvictor {
         pending_reads: Arc<SyncMutex<HashSet<std::path::PathBuf>>>,
         system_clock: Arc<dyn SystemClock>,
     ) {
+        let mut prefer_read = false;
         loop {
-            tokio::select! {
-                Some((path, access)) = mutation_rx.recv() => {
-                    match access {
-                        EntryAccess::Write(bytes) => {
-                            inner
-                                .track_entry_accessed(path, bytes, system_clock.now(), true)
-                                .await;
-                        }
-                        EntryAccess::Delete => inner.delete_entry(path).await,
-                        EntryAccess::Read(_) => unreachable!("read work uses the read queue"),
+            // Alternate priority after each item. When both queues stay ready,
+            // each makes progress every two iterations; when only one is ready,
+            // it continues without waiting for the other queue.
+            let handled_read = if prefer_read {
+                tokio::select! {
+                    biased;
+                    Some((path, bytes)) = read_rx.recv() => {
+                        Self::process_read(
+                            inner.clone(),
+                            pending_reads.clone(),
+                            path,
+                            bytes,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        true
                     }
+                    Some((path, access)) = mutation_rx.recv() => {
+                        Self::process_mutation(
+                            inner.clone(),
+                            path,
+                            access,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        false
+                    }
+                    else => return,
                 }
-                Some((path, bytes)) = read_rx.recv() => {
-                    Self::process_read(
-                        inner.clone(),
-                        pending_reads.clone(),
-                        path,
-                        bytes,
-                        system_clock.clone(),
-                    )
+            } else {
+                tokio::select! {
+                    biased;
+                    Some((path, access)) = mutation_rx.recv() => {
+                        Self::process_mutation(
+                            inner.clone(),
+                            path,
+                            access,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        false
+                    }
+                    Some((path, bytes)) = read_rx.recv() => {
+                        Self::process_read(
+                            inner.clone(),
+                            pending_reads.clone(),
+                            path,
+                            bytes,
+                            system_clock.clone(),
+                        )
+                        .await;
+                        true
+                    }
+                    else => return,
+                }
+            };
+            prefer_read = !handled_read;
+        }
+    }
+
+    async fn process_mutation(
+        inner: Arc<FsCacheEvictorInner>,
+        path: std::path::PathBuf,
+        access: EntryAccess,
+        system_clock: Arc<dyn SystemClock>,
+    ) {
+        match access {
+            EntryAccess::Write(bytes) => {
+                inner
+                    .track_entry_accessed(path, bytes, system_clock.now(), true)
                     .await;
-                }
-                else => return,
             }
+            EntryAccess::Delete => inner.delete_entry(path).await,
+            EntryAccess::Read(_) => unreachable!("read work uses the read queue"),
         }
     }
 
