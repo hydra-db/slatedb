@@ -571,6 +571,20 @@ struct FsCacheEvictor {
     file_handle_cache: FileHandleCache,
 }
 
+impl Drop for FsCacheEvictor {
+    fn drop(&mut self) {
+        // Dropping a Tokio JoinHandle detaches its task. The periodic scan task
+        // otherwise runs forever and retains FsCacheEvictorInner, including its
+        // file-handle cache, after the owning CachedObjectStore is gone.
+        if let Some(handle) = self.background_scan_handle.get() {
+            handle.abort();
+        }
+        if let Some(handle) = self.background_evict_handle.get() {
+            handle.abort();
+        }
+    }
+}
+
 impl FsCacheEvictor {
     fn new(
         root_folder: std::path::PathBuf,
@@ -1416,6 +1430,38 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect::<Vec<_>>();
         assert_eq!(file_paths.len(), 2); // the folder file "." is also counted
+    }
+
+    #[tokio::test]
+    async fn test_evictor_drop_releases_background_task_state() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_drop_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let file_handle_cache = FileHandleCache::new(1);
+        let cache_state = Arc::downgrade(&file_handle_cache.inner);
+        let evictor = FsCacheEvictor::new(
+            temp_dir.path().to_path_buf(),
+            1024,
+            Some(Duration::from_secs(3600)),
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            file_handle_cache,
+        );
+
+        evictor.start().await;
+        assert!(cache_state.upgrade().is_some());
+        drop(evictor);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cache_state.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the evictor should release background task state");
     }
 
     #[tokio::test]
