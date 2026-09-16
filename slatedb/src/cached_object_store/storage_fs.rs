@@ -1314,7 +1314,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_drop_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let file_handle_cache = FileHandleCache::new(1);
         let cache_state = Arc::downgrade(&file_handle_cache.inner);
         let evictor = FsCacheEvictor::new(
@@ -1383,7 +1383,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_coalesced_reads_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let evictor = FsCacheEvictor::new(
             temp_dir.path().to_path_buf(),
             1024,
@@ -1417,7 +1417,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_deleted_read_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let inner = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024,
@@ -1448,7 +1448,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_read_delete_race_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let inner = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024,
@@ -1467,7 +1467,7 @@ mod tests {
             16,
             Arc::new(DefaultSystemClock::new()),
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(1), async {
             while pending_reads.lock().contains(&path) {
                 tokio::task::yield_now().await;
             }
@@ -1489,7 +1489,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_fresh_read_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let inner = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024,
@@ -1508,7 +1508,7 @@ mod tests {
             16,
             Arc::new(DefaultSystemClock::new()),
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(1), async {
             while pending_reads.lock().contains(&path) {
                 tokio::task::yield_now().await;
             }
@@ -1530,7 +1530,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_isolated_mutations_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let evictor = FsCacheEvictor::new(
             temp_dir.path().to_path_buf(),
             1024,
