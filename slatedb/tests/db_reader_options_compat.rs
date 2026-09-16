@@ -25,8 +25,8 @@ async fn downstream_can_configure_reader_wal_replay_concurrency() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let db = Db::open("reader-options-compat", Arc::clone(&object_store))
         .await
-        .unwrap();
-    db.close().await.unwrap();
+        .expect("db should open");
+    db.close().await.expect("db should close");
 
     let result = DbReader::builder("reader-options-compat", object_store)
         .with_wal_replay_concurrency(0)
