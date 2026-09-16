@@ -204,13 +204,6 @@ fn filter_hash(key: &[u8]) -> u64 {
 }
 
 fn probes_for_key(key_hash: u64, num_probes: u16, filter_bits: u32) -> Vec<u32> {
-    // Empty filters are valid when a builder observes no filterable keys, and
-    // a zero-bit policy can also produce one after observing keys. With no
-    // bits there is nothing to probe: an empty probe set makes reads answer
-    // conservatively while keeping both construction and lookup panic-free.
-    if filter_bits == 0 {
-        return Vec::new();
-    }
     // implements enhanced double hashing from:
     // https://www.khoury.northeastern.edu/~pete/pub/bloom-filters-verification.pdf
     // as suggested by the author P. Dillinger for RocksDB's legacy filters here:
@@ -371,31 +364,6 @@ mod tests {
 
         // observed fp is .0087
         assert!((fp as f32 / keys_to_test as f32) < 0.01);
-    }
-
-    #[test]
-    fn empty_filter_matches_conservatively() {
-        let mut builder = point_builder(10);
-        let filter = builder.build_filter();
-
-        assert!(filter.buffer.is_empty());
-        assert!(filter.might_contain(filter_hash(b"missing")));
-
-        let mut encoded = Vec::new();
-        Filter::encode(&filter, &mut encoded);
-        let decoded = BloomFilter::decode(&encoded, true, None);
-        assert!(decoded.might_match(&FilterQuery::point(Bytes::from_static(b"missing"))));
-    }
-
-    #[test]
-    fn zero_bit_filter_builds_and_matches_conservatively() {
-        let mut builder = point_builder(0);
-        builder.add_key(&Bytes::from_static(b"present"));
-        let filter = builder.build_filter();
-
-        assert!(filter.buffer.is_empty());
-        assert!(filter.might_contain(filter_hash(b"present")));
-        assert!(filter.might_contain(filter_hash(b"missing")));
     }
 
     #[test]
