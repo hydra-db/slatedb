@@ -2541,13 +2541,16 @@ mod tests {
             .build()
             .await
             .unwrap();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            old.put(b"stale", b"value")
-        )
-        .await
-        .expect("stale writer must fail promptly")
-        .is_err());
+        let stale_write = async {
+            let handle = old.put(b"stale", b"value").await?;
+            handle.await_durable().await
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), stale_write)
+                .await
+                .expect("stale writer must fail promptly")
+                .is_err()
+        );
         assert!(replacement.get(b"stale").await.unwrap().is_none());
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), old.close())
             .await
