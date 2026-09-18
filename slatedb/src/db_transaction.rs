@@ -2265,14 +2265,24 @@ mod sequence_finalization_tests {
         let db = crate::Db::open("finalization/gap", Arc::new(InMemory::new()))
             .await
             .unwrap();
-        db.put(b"hot", b"one").await.unwrap().await_durable().await.unwrap();
+        db.put(b"hot", b"one")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         let stale = db
             .begin(IsolationLevel::SerializableSnapshot)
             .await
             .unwrap();
         stale.get(b"hot").await.unwrap();
         stale.put(b"lost", b"no").unwrap();
-        db.put(b"hot", b"two").await.unwrap().await_durable().await.unwrap();
+        db.put(b"hot", b"two")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         assert_eq!(
             stale.commit().await.unwrap_err().kind(),
             crate::ErrorKind::Transaction
@@ -2359,7 +2369,12 @@ mod sequence_finalization_tests {
             .await
             .unwrap();
         stale.put(b"another-placeholder", b"bad").unwrap();
-        db.put(b"new/key", b"winner").await.unwrap().await_durable().await.unwrap();
+        db.put(b"new/key", b"winner")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         let error = stale
             .commit_with_finalizer(&options(), |_, batch| {
                 batch.try_map_puts(|_, v| Ok((Bytes::from_static(b"new/key"), v)))
