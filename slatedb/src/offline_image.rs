@@ -299,6 +299,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Invalid);
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(
             validate_entry_lengths(1, u32::MAX as usize + 1)
                 .unwrap_err()
