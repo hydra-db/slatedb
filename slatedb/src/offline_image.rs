@@ -11,7 +11,7 @@ use bytes::Bytes;
 use fail_parallel::FailPointRegistry;
 use object_store::{path::Path, ObjectStore};
 use slatedb_common::clock::DefaultSystemClock;
-use ulid::Ulid;
+use slatedb_common::DbRand;
 
 use crate::block_cache_policy::BlockCachePolicy;
 use crate::db_state::{SortedRun, SsTableId, SsTableView};
@@ -21,6 +21,7 @@ use crate::manifest::ManifestCore;
 use crate::object_store_tag::TableStoreKind;
 use crate::tablestore::{EncodedSsTableWriter, TableStore};
 use crate::types::{RowEntry, ValueDeletable};
+use crate::utils::IdGenerator;
 use crate::{Error, PathResolver};
 
 /// Settings for an [`OfflineImageBuilder`].
@@ -57,6 +58,8 @@ pub struct OfflineImageResult {
 pub struct OfflineImageBuilder {
     manifest_store: Arc<ManifestStore>,
     table_store: Arc<TableStore>,
+    clock: Arc<DefaultSystemClock>,
+    rand: Arc<DbRand>,
     target_sst_size_bytes: usize,
     current_writer: Option<EncodedSsTableWriter>,
     current_sst_bytes: usize,
@@ -81,7 +84,7 @@ impl OfflineImageBuilder {
         let path = path.into();
         let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
         let clock = Arc::new(DefaultSystemClock::new());
-        if StoredManifest::try_load(manifest_store.clone(), clock)
+        if StoredManifest::try_load(manifest_store.clone(), clock.clone())
             .await
             .map_err(Error::from)?
             .is_some()
@@ -104,6 +107,8 @@ impl OfflineImageBuilder {
         Ok(Self {
             manifest_store,
             table_store,
+            clock,
+            rand: Arc::new(DbRand::default()),
             target_sst_size_bytes: options.target_sst_size_bytes,
             current_writer: None,
             current_sst_bytes: 0,
@@ -127,10 +132,14 @@ impl OfflineImageBuilder {
             )));
         }
 
-        let writer = self.current_writer.get_or_insert_with(|| {
-            self.table_store
-                .table_writer(SsTableId::new(Ulid::new()), None)
-        });
+        if self.current_writer.is_none() {
+            let id = self.rand.rng().gen_ulid(self.clock.as_ref());
+            self.current_writer = Some(self.table_store.table_writer(SsTableId::new(id), None));
+        }
+        let writer = self
+            .current_writer
+            .as_mut()
+            .expect("offline image writer was initialized above");
         if let Some(block_size) = writer
             .add(RowEntry::new(
                 key.clone(),
@@ -163,13 +172,9 @@ impl OfflineImageBuilder {
                 .compacted
                 .push(SortedRun::new(0, self.ssts.iter().cloned()));
         }
-        StoredManifest::create_new_db(
-            self.manifest_store,
-            core,
-            Arc::new(DefaultSystemClock::new()),
-        )
-        .await
-        .map_err(Error::from)?;
+        StoredManifest::create_new_db(self.manifest_store, core, self.clock)
+            .await
+            .map_err(Error::from)?;
 
         Ok(OfflineImageResult {
             entries: self.entries,
