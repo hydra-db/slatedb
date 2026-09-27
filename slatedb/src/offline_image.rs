@@ -126,6 +126,7 @@ impl OfflineImageBuilder {
                 "offline image keys must not be empty".to_string(),
             ));
         }
+        validate_entry_lengths(key.len(), value.len())?;
         if self.last_key.as_ref().is_some_and(|last| last >= &key) {
             return Err(Error::invalid(format!(
                 "offline image keys must be strictly increasing; previous={:?}, next={:?}",
@@ -194,6 +195,22 @@ impl OfflineImageBuilder {
     }
 }
 
+fn validate_entry_lengths(key_len: usize, value_len: usize) -> Result<(), Error> {
+    if key_len > u16::MAX as usize {
+        return Err(Error::invalid(format!(
+            "offline image key length {key_len} exceeds {} bytes",
+            u16::MAX
+        )));
+    }
+    if value_len > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "offline image value length {value_len} exceeds {} bytes",
+            u32::MAX
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -201,7 +218,7 @@ mod tests {
     use bytes::Bytes;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
 
-    use super::{OfflineImageBuilder, OfflineImageOptions};
+    use super::{validate_entry_lengths, OfflineImageBuilder, OfflineImageOptions};
     use crate::{Db, ErrorKind};
 
     #[tokio::test]
@@ -265,5 +282,28 @@ mod tests {
             .err()
             .expect("existing database must be rejected");
         assert_eq!(err.kind(), ErrorKind::Invalid);
+    }
+
+    #[tokio::test]
+    async fn rejects_encoder_lengths_as_invalid_input() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut builder = OfflineImageBuilder::create(
+            Path::from("oversized"),
+            store,
+            OfflineImageOptions::default(),
+        )
+        .await
+        .unwrap();
+        let error = builder
+            .add(Bytes::from(vec![b'k'; u16::MAX as usize + 1]), Bytes::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert_eq!(
+            validate_entry_lengths(1, u32::MAX as usize + 1)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Invalid
+        );
     }
 }
