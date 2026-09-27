@@ -1315,16 +1315,17 @@ mod tests {
             .tempdir()
             .unwrap();
         let recorder = MetricsRecorderHelper::noop();
-        let file_handle_cache = FileHandleCache::new(1);
-        let cache_state = Arc::downgrade(&file_handle_cache.inner);
+        // The background tasks share the evictor state, which holds the stats.
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_state = Arc::downgrade(&stats);
         let evictor = FsCacheEvictor::new(
             temp_dir.path().to_path_buf(),
             1024,
             Some(Duration::from_secs(3600)),
-            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            stats,
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
-            file_handle_cache,
+            FileHandleCache::new(1),
         );
 
         evictor.start().await;
