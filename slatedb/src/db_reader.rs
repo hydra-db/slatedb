@@ -1,4 +1,5 @@
 use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
+use slatedb_txn_obj::TransactionalObject;
 use {
     crate::{
         bytes_range::{ByteRangeBounds, BytesRange},
@@ -139,7 +140,7 @@ struct DbReaderInner {
     mode: DbReaderMode,
     state: RwLock<Arc<ReaderState>>,
     refresh_gate: Mutex<()>,
-    retired_checkpoints: RwLock<Vec<(Checkpoint, Weak<()>)>>,
+    retired_checkpoints: RwLock<Vec<(Checkpoint, Weak<ReaderCheckpointGeneration>)>>,
     close_gate: Mutex<()>,
     closing: AtomicBool,
     active_snapshots: AtomicUsize,
@@ -161,13 +162,18 @@ enum DbReaderMessage {
     PollManifest,
 }
 
+#[derive(Default)]
+struct ReaderCheckpointGeneration {
+    lease_lost: AtomicBool,
+}
+
 #[derive(Clone)]
 struct ReaderState {
     manifest_id: u64,
     checkpoint: Option<Checkpoint>,
     // Shared across WAL-only states so every snapshot of this checkpoint
     // generation keeps its GC lease alive until the final view is released.
-    checkpoint_pin: Arc<()>,
+    checkpoint_pin: Arc<ReaderCheckpointGeneration>,
     manifest: Manifest,
     imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
     last_wal_id: u64,
@@ -579,7 +585,7 @@ impl DbReaderInner {
         Ok(ReaderState {
             manifest_id,
             checkpoint,
-            checkpoint_pin: Arc::new(()),
+            checkpoint_pin: Arc::new(ReaderCheckpointGeneration::default()),
             manifest,
             imm_memtable,
             last_wal_id,
@@ -640,6 +646,11 @@ impl DbReaderInner {
                     // GC reaped it. Re-establish a fresh checkpoint against the latest
                     // manifest instead of failing the reader permanently.
                     warn!("reader checkpoint missing, re-establishing [checkpoint_id={id}]");
+                    self.state
+                        .read()
+                        .checkpoint_pin
+                        .lease_lost
+                        .store(true, Ordering::Release);
                     let checkpoint = self
                         .create_next_checkpoint(stored_manifest, Some(id))
                         .await?;
@@ -723,21 +734,64 @@ impl DbReaderInner {
         manifest: &mut StoredManifest,
     ) -> Result<(), SlateDBError> {
         let checkpoints = self.retired_checkpoints.read().clone();
-        let mut retained = Vec::new();
-        for (mut checkpoint, pin) in checkpoints {
-            if let Some(_live_generation) = pin.upgrade() {
-                let deadline = checkpoint
-                    .expire_time
-                    .expect("managed checkpoint must expire")
-                    .sub(self.options.checkpoint_lifetime / 2);
-                if self.system_clock.now() > deadline {
-                    checkpoint = manifest
-                        .refresh_checkpoint(checkpoint.id, self.options.checkpoint_lifetime)
-                        .await?;
+        if checkpoints.is_empty() {
+            return Ok(());
+        }
+        let mut live = Vec::new();
+        let mut dead_ids = BTreeSet::new();
+        for (checkpoint, pin) in checkpoints {
+            match pin.upgrade() {
+                Some(generation) if !generation.lease_lost.load(Ordering::Acquire) => {
+                    live.push((checkpoint, pin, generation));
                 }
-                retained.push((checkpoint, pin));
+                _ => {
+                    dead_ids.insert(checkpoint.id);
+                }
+            }
+        }
+        let live_ids: BTreeSet<_> = live.iter().map(|(cp, _, _)| cp.id).collect();
+        let clock = Arc::clone(&self.system_clock);
+        let lifetime = self.options.checkpoint_lifetime;
+        // One conditional manifest update for all retired leases, with deadlines
+        // recomputed against the latest manifest on every CAS retry.
+        manifest
+            .maybe_apply_update(|stored| {
+                let mut next = stored.object().clone();
+                let previous_count = next.core.checkpoints.len();
+                next.core
+                    .checkpoints
+                    .retain(|cp| !dead_ids.contains(&cp.id));
+                let mut changed = previous_count != next.core.checkpoints.len();
+                let now = clock.now();
+                for checkpoint in &mut next.core.checkpoints {
+                    if live_ids.contains(&checkpoint.id)
+                        && now
+                            > checkpoint
+                                .expire_time
+                                .expect("managed checkpoint must expire")
+                                .sub(lifetime / 2)
+                    {
+                        checkpoint.expire_time = Some(now + lifetime);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let mut dirty = stored.prepare_dirty()?;
+                    dirty.value = next;
+                    Ok(Some(dirty))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+        let mut retained = Vec::new();
+        for (previous, pin, generation) in live {
+            if let Some(checkpoint) = manifest.db_state().find_checkpoint(previous.id) {
+                retained.push((checkpoint.clone(), pin));
             } else {
-                manifest.delete_checkpoint(checkpoint.id).await?;
+                // GC already removed this lease. Keep the current reader alive,
+                // but reject subsequent operations on the now-unprotected view.
+                generation.lease_lost.store(true, Ordering::Release);
             }
         }
         *self.retired_checkpoints.write() = retained;
@@ -755,8 +809,8 @@ impl DbReaderInner {
                 )
                 .await?;
 
-                self.maintain_retired_checkpoints(&mut manifest).await?;
                 self.maybe_refresh_checkpoint(&mut manifest).await?;
+                self.maintain_retired_checkpoints(&mut manifest).await?;
                 let latest_manifest = manifest.manifest();
                 if self.should_reestablish_checkpoint(&latest_manifest.core) {
                     let checkpoint = self.create_next_checkpoint(&mut manifest, None).await?;
@@ -1530,6 +1584,16 @@ impl DbReader {
 }
 
 impl DbReaderSnapshot {
+    fn check_valid(&self) -> Result<(), SlateDBError> {
+        self.inner.check_closed()?;
+        if self.state.checkpoint_pin.lease_lost.load(Ordering::Acquire) {
+            if let Some(checkpoint) = self.state.checkpoint.as_ref() {
+                return Err(SlateDBError::CheckpointMissing(checkpoint.id));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the highest durable sequence visible to this snapshot.
     pub fn seq(&self) -> u64 {
         self.started_seq
@@ -1567,7 +1631,7 @@ impl DbReaderSnapshot {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
-        self.inner.check_closed()?;
+        self.check_valid()?;
         self.inner
             .reader
             .get_key_value_with_options(
@@ -1636,7 +1700,7 @@ impl DbReaderSnapshot {
         options: &ScanOptions,
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, crate::Error> {
-        self.inner.check_closed()?;
+        self.check_valid()?;
         self.inner
             .reader
             .scan_with_options(
@@ -1811,7 +1875,7 @@ mod tests {
     use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
     use {
         super::{
-            DbReaderMessage, ManifestPoller, ReaderState, WalReplayEnd,
+            DbReaderMessage, ManifestPoller, ReaderCheckpointGeneration, ReaderState, WalReplayEnd,
             DEFAULT_WAL_REPLAY_CONCURRENCY,
         },
         crate::{
@@ -2947,7 +3011,11 @@ mod tests {
             TestProvider::new(Path::from("/tmp/test_retired_checkpoint"), object_store);
         let clock = Arc::new(MockSystemClock::new());
         provider.system_clock = clock.clone();
-        let db = provider.new_db(Settings::default()).await.unwrap();
+        let db = Db::builder(provider.path.clone(), Arc::clone(&provider.object_store))
+            .with_system_clock(clock.clone())
+            .build()
+            .await
+            .unwrap();
         db.put(b"key", b"before").await.unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
@@ -2974,12 +3042,8 @@ mod tests {
 
         // WAL-only state changes must reuse the generation pin, including when
         // the oldest snapshot retains an earlier Arc<ReaderState>.
-        db.put(b"wal", b"durable")
-            .await
-            .unwrap()
-            .await_durable()
-            .await
-            .unwrap();
+        db.put(b"wal", b"durable").await.unwrap();
+        db.flush().await.unwrap();
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
         assert_eq!(
             reader.inner.state.read().checkpoint.as_ref().unwrap().id,
@@ -3103,6 +3167,168 @@ mod tests {
             .await
             .unwrap();
         assert!(manifest.manifest.core.checkpoints.is_empty());
+        db.close().await.unwrap();
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn missing_snapshot_checkpoint_does_not_stop_managed_recovery(#[case] retired: bool) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut provider =
+            TestProvider::new(Path::from("/tmp/test_missing_snapshot_lease"), object_store);
+        let clock = Arc::new(MockSystemClock::new());
+        provider.system_clock = clock.clone();
+        let db = Db::builder(provider.path.clone(), Arc::clone(&provider.object_store))
+            .with_system_clock(clock.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key", b"before").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let reader = provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_secs(3600),
+                    checkpoint_lifetime: Duration::from_secs(7200),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let old = reader.snapshot().await.unwrap();
+        let old_id = old.state.checkpoint.as_ref().unwrap().id;
+        let mut poller = ManifestPoller {
+            inner: Arc::clone(&reader.inner),
+        };
+        db.put(b"key", b"after").await.unwrap();
+        db.flush().await.unwrap();
+        if retired {
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+            poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        }
+        let mut manifest = StoredManifest::load(provider.manifest_store(), clock.clone())
+            .await
+            .unwrap();
+        manifest.delete_checkpoint(old_id).await.unwrap();
+        clock.advance(Duration::from_secs(3601)).await;
+        poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap().as_deref(),
+            Some(b"after".as_slice())
+        );
+        assert!(old
+            .get(b"key")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains(&old_id.to_string()));
+        assert!(old.scan(..).await.is_err());
+        // Future ticks keep discovering writes, despite the invalid old view.
+        db.put(b"key", b"latest").await.unwrap();
+        db.flush().await.unwrap();
+        poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap().as_deref(),
+            Some(b"latest".as_slice())
+        );
+        drop(old);
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_checkpoint_renewals_and_deletions_are_batched() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut provider = TestProvider::new(
+            Path::from("/tmp/test_batched_snapshot_leases"),
+            object_store,
+        );
+        let clock = Arc::new(MockSystemClock::new());
+        provider.system_clock = clock.clone();
+        let db = Db::builder(provider.path.clone(), Arc::clone(&provider.object_store))
+            .with_system_clock(clock.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key", b"before").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let reader = provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_secs(3600),
+                    checkpoint_lifetime: Duration::from_secs(7200),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut views = Vec::new();
+        for value in [b"one".as_slice(), b"two", b"three", b"four"] {
+            views.push(reader.snapshot().await.unwrap());
+            db.put(b"key", value).await.unwrap();
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+            reader.refresh().await.unwrap();
+        }
+        let gate = reader.inner.refresh_gate.lock().await;
+        clock.set(3_601_000);
+        let mut manifest = StoredManifest::load(provider.manifest_store(), clock.clone())
+            .await
+            .unwrap();
+        let before = manifest.id();
+        reader
+            .inner
+            .maintain_retired_checkpoints(&mut manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.id(),
+            before + 1,
+            "all four lease renewals need one manifest update"
+        );
+        for view in &views {
+            let cp = manifest
+                .db_state()
+                .find_checkpoint(view.state.checkpoint.as_ref().unwrap().id)
+                .unwrap();
+            assert!(cp.expire_time > view.state.checkpoint.as_ref().unwrap().expire_time);
+        }
+        drop(views);
+        let before = manifest.id();
+        reader
+            .inner
+            .maintain_retired_checkpoints(&mut manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.id(),
+            before + 1,
+            "all four retirements need one manifest update"
+        );
+        assert_eq!(manifest.db_state().checkpoints.len(), 1);
+        drop(gate);
+        reader.close().await.unwrap();
         db.close().await.unwrap();
     }
 
@@ -4143,7 +4369,7 @@ mod tests {
         // Seed the prior checkpoint state with IMMs.
         let input_tables: Vec<_> = case.tables.iter().map(InputMemtable::build).collect();
         let prior_state = ReaderState {
-            checkpoint_pin: Arc::new(()),
+            checkpoint_pin: Arc::new(ReaderCheckpointGeneration::default()),
             manifest_id: stored_manifest.id(),
             checkpoint: Some(test_checkpoint(
                 stored_manifest.id(),
@@ -4258,7 +4484,7 @@ mod tests {
         let status_manager = status_manager_for_core(current_core);
 
         let prior_state = ReaderState {
-            checkpoint_pin: Arc::new(()),
+            checkpoint_pin: Arc::new(ReaderCheckpointGeneration::default()),
             manifest_id: 1,
             checkpoint: Some(test_checkpoint(1, test_provider.system_clock.clone())),
             manifest: Manifest::initial(current_core.clone()),
