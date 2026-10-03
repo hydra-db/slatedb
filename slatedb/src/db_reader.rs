@@ -691,6 +691,25 @@ impl DbReaderInner {
 
     async fn refresh(&self) -> Result<(), SlateDBError> {
         let _snapshot_guard = self.snapshot_gate.write().await;
+        self.refresh_locked().await
+    }
+
+    async fn poll_manifest(&self) -> Result<(), SlateDBError> {
+        // A queued exclusive request on Tokio's fair RwLock also blocks NEW
+        // snapshots. A long-running query could therefore make every later
+        // query wait for its lifetime, even though all of them are readers.
+        // Background discovery can wait for the next tick. Explicit refresh
+        // still uses refresh() and must not silently skip a freshness barrier.
+        let Ok(_snapshot_guard) = self.snapshot_gate.try_write() else {
+            return Ok(());
+        };
+        self.refresh_locked().await
+    }
+
+    // Both callers hold the exclusive snapshot gate across this operation:
+    // checkpoint replacement and WAL installation must not retire a view
+    // that an active snapshot still depends on.
+    async fn refresh_locked(&self) -> Result<(), SlateDBError> {
         match self.mode {
             DbReaderMode::ManagedCheckpoint => {
                 let mut manifest = StoredManifest::load(
@@ -854,7 +873,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
         assert!(matches!(message, DbReaderMessage::PollManifest));
-        let result = self.inner.refresh().await;
+        let result = self.inner.poll_manifest().await;
         if self.inner.mode == DbReaderMode::FollowLatest {
             if let Err(error) = result {
                 warn!("failed to refresh reader to latest manifest [error={error:?}]");
@@ -2741,6 +2760,84 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    #[rstest]
+    #[case(DbReaderMode::ManagedCheckpoint)]
+    #[case(DbReaderMode::FollowLatest)]
+    #[tokio::test]
+    async fn background_refresh_does_not_queue_behind_active_snapshot(#[case] mode: DbReaderMode) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_snapshot_poller_contention");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        db.put(b"key", b"before").await.unwrap();
+        db.flush().await.unwrap();
+        let reader = DbReader::open(
+            path,
+            object_store,
+            mode,
+            DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60 * 60),
+                checkpoint_lifetime: Duration::from_secs(3 * 60 * 60),
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let first = reader.snapshot().await.unwrap();
+        let before_manifest = reader.manifest().id();
+        let before_checkpoint = reader.inner.state.read().checkpoint.clone();
+        db.put(b"key", b"after").await.unwrap();
+        db.flush().await.unwrap();
+
+        let mut poller = ManifestPoller {
+            inner: Arc::clone(&reader.inner),
+        };
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            poller.handle(DbReaderMessage::PollManifest),
+        )
+        .await
+        .expect("background refresh must defer instead of queuing an exclusive lock")
+        .unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(200), reader.snapshot())
+            .await
+            .expect("a long read must not block another snapshot through the poller")
+            .unwrap();
+        assert_eq!(second.seq(), first.seq());
+        assert_eq!(reader.manifest().id(), before_manifest);
+        assert_eq!(reader.inner.state.read().checkpoint, before_checkpoint);
+        for snapshot in [&first, &second] {
+            assert_eq!(
+                snapshot.get(b"key").await.unwrap(),
+                Some(Bytes::from_static(b"before"))
+            );
+        }
+
+        drop(first);
+        // A remaining snapshot must keep the checkpoint and old view protected.
+        poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        assert_eq!(reader.inner.state.read().checkpoint, before_checkpoint);
+        assert_eq!(
+            second.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"before"))
+        );
+        drop(second);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            poller.handle(DbReaderMessage::PollManifest),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"after"))
+        );
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn explicit_refresh_replays_durable_wal_without_waiting_for_poller() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2775,6 +2872,51 @@ mod tests {
             Some(Bytes::from_static(b"value"))
         );
 
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_still_waits_for_snapshot_and_observes_new_writes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_snapshot_explicit_refresh_barrier");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let reader = DbReader::open(
+            path,
+            object_store,
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60 * 60),
+                checkpoint_lifetime: Duration::from_secs(3 * 60 * 60),
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let snapshot = reader.snapshot().await.unwrap();
+        db.put(b"key", b"committed")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+        let mut refresh = Box::pin(reader.refresh());
+        assert!(
+            futures::poll!(refresh.as_mut()).is_pending(),
+            "explicit refresh must not report success without advancing"
+        );
+        assert_eq!(snapshot.get(b"key").await.unwrap(), None);
+        drop(snapshot);
+        tokio::time::timeout(Duration::from_secs(2), refresh)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"committed"))
+        );
         reader.close().await.unwrap();
         db.close().await.unwrap();
     }
