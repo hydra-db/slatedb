@@ -143,7 +143,11 @@ impl From<slatedb::Error> for Error {
             },
             slatedb::ErrorKind::Unavailable => Error::Unavailable { message },
             slatedb::ErrorKind::Invalid => Error::Invalid { message },
-            slatedb::ErrorKind::Data => Error::Data { message },
+            // Preserve the existing binding API for an uninitialized database.
+            // Rust callers retain the more specific DatabaseMissing category.
+            slatedb::ErrorKind::Data | slatedb::ErrorKind::DatabaseMissing => {
+                Error::Data { message }
+            }
             slatedb::ErrorKind::Internal => Error::Internal { message },
             _ => Error::Internal { message },
         }
@@ -177,6 +181,25 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn missing_database_preserves_binding_data_error() {
+        let error = match slatedb::DbReader::open(
+            "missing-binding-database",
+            Arc::new(slatedb::object_store::memory::InMemory::new()),
+            slatedb::DbReaderMode::ManagedCheckpoint,
+            slatedb::config::DbReaderOptions::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("reader must reject an uninitialized database"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), slatedb::ErrorKind::DatabaseMissing);
+        assert!(
+            matches!(Error::from(error), Error::Data { message } if message.contains("missing-binding-database"))
+        );
+    }
 
     #[test]
     fn wal_errors_preserve_binding_categories() {
