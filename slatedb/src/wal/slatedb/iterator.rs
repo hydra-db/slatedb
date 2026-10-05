@@ -21,6 +21,10 @@ use crate::RowEntry;
 use super::sst_iterator::{WalSstIterator, WalSstIteratorOptions};
 use super::store::WalTableStore;
 
+/// Shared by the speculative queue and its current file. Keep encoded bytes
+/// bounded independently of both file sizes and replay/decompression size.
+const MAX_PREFETCHED_WAL_BYTES: usize = 4 * 1024 * 1024;
+
 #[async_trait]
 pub(crate) trait ManifestReader: Send + Sync + 'static {
     async fn manifest(&self) -> Result<VersionedManifest, SlateDBError>;
@@ -63,6 +67,12 @@ enum WalFileIterator {
 }
 
 impl WalFileIterator {
+    async fn prefetch(&mut self, max_bytes: usize) -> Result<(), SlateDBError> {
+        match self {
+            Self::Empty(_) => Ok(()),
+            Self::Sst(iter) => iter.prefetch_initial_blocks(max_bytes).await,
+        }
+    }
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         match self {
             Self::Empty(iter) => iter.next().await,
@@ -158,11 +168,12 @@ impl CurrentWalFile {
 }
 
 /// Iterates over the writes in a range of WAL files, preloading up to
-/// `sst_batch_size` WAL SST handles concurrently. Returns the rows of one WAL
+/// `sst_batch_size` WAL SST handles and bounded encoded payload prefixes
+/// concurrently. Returns the rows of one WAL
 /// file per [`WalRows`], and verifies that files carry strictly increasing seq
 /// ranges — the ordering callers rely on to split and tag memtables safely.
 ///
-/// A file's rows are read sequentially only when it is returned from
+/// A file's rows are decoded sequentially only when it is returned from
 /// [`Self::next`], so at most one file's rows are materialized at a time. For an
 /// unbounded end, open tasks poll their assigned future WAL IDs until the files
 /// appear or the manifest proves that a missing file was truncated.
@@ -250,6 +261,10 @@ impl SlateDbWalIterator {
         }
 
         self.next_wal_id = next_wal_id.checked_add(1);
+        // Refilling the queue can coexist with one current collector. Divide
+        // the total budget across both, including very large configured queues.
+        let prefetch_bytes =
+            MAX_PREFETCHED_WAL_BYTES / self.options.sst_batch_size.saturating_add(1);
 
         async fn try_open_file_iter(
             wal_id: u64,
@@ -280,12 +295,28 @@ impl SlateDbWalIterator {
             sst_iter_options: WalSstIteratorOptions,
             wal_store: Arc<WalTableStore>,
             end_bound: WalIteratorEndBound,
+            prefetch_bytes: usize,
         ) -> Result<WalRowsCollector, WalError> {
             loop {
                 match try_open_file_iter(wal_id, sst_iter_options.clone(), Arc::clone(&wal_store))
                     .await
                 {
-                    Ok(iter) => return Ok(iter),
+                    Ok(mut collector) => {
+                        // Once the handle exists, a missing payload is truncation,
+                        // not a future file that the unbounded iterator should poll.
+                        collector
+                            .iter
+                            .prefetch(prefetch_bytes)
+                            .await
+                            .map_err(|err| {
+                                if err.has_object_store_not_found() {
+                                    WalError::WalTruncated(wal_id)
+                                } else {
+                                    err.into()
+                                }
+                            })?;
+                        return Ok(collector);
+                    }
                     Err(err) if err.has_object_store_not_found() => {
                         let WalIteratorEndBound::Unbounded {
                             manifest_reader,
@@ -314,6 +345,7 @@ impl SlateDbWalIterator {
             self.options.sst_iter_options.clone(),
             Arc::clone(&self.wal_store),
             self.end_bound.clone(),
+            prefetch_bytes,
         ));
         self.next_files.push_back(handle);
         true
@@ -438,6 +470,9 @@ impl Drop for SlateDbWalIterator {
         }
     }
 }
+
+#[cfg(test)]
+mod prefetch_tests;
 
 #[cfg(test)]
 mod tests {

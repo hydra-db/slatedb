@@ -1773,13 +1773,13 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         self
     }
 
-    /// Sets the maximum number of immutable WAL SSTs opened concurrently while
-    /// the reader is established or refreshed.
+    /// Sets the maximum number of immutable WAL SST handles and encoded payload
+    /// prefixes prefetched concurrently while the reader is established or refreshed.
     ///
     /// Raising this value can reduce cold-reader latency for databases with a
     /// long uncompacted WAL tail at the cost of additional object-store
-    /// requests and temporary replay memory. The default is 4, preserving the
-    /// historical replay behavior.
+    /// requests. Speculative payload bytes share a 4 MiB budget; decompression
+    /// and replay remain ordered, one file at a time. The default is 4.
     pub fn with_wal_replay_concurrency(mut self, concurrency: usize) -> Self {
         self.wal_replay_concurrency = concurrency;
         self

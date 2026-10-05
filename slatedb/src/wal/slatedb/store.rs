@@ -12,6 +12,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::Serialize;
 
+use crate::blob::ReadOnlyBlob;
 use crate::db_state::{SsTableId, SsTableInfo, SstType};
 use crate::error::SlateDBError;
 use crate::flatbuffer_types::SsTableIndexOwned;
@@ -42,6 +43,37 @@ pub(crate) struct WalFileHandle {
     pub(crate) id: WalFileId,
     pub(crate) format_version: u16,
     pub(crate) info: SsTableInfo,
+}
+
+/// Encoded blocks only: decompression is deferred until this WAL is consumed.
+pub(crate) struct PrefetchedWalBlocks {
+    pub(crate) blocks: Range<usize>,
+    range: Range<u64>,
+    bytes: Bytes,
+}
+
+struct PrefetchedWalBlob<'a> {
+    remote: &'a ReadOnlyObject,
+    prefetched: Option<&'a PrefetchedWalBlocks>,
+}
+
+impl ReadOnlyBlob for PrefetchedWalBlob<'_> {
+    async fn len(&self) -> Result<u64, SlateDBError> {
+        self.remote.len().await
+    }
+
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes, SlateDBError> {
+        if let Some(prefetched) = self.prefetched {
+            if range == prefetched.range {
+                return Ok(prefetched.bytes.clone());
+            }
+        }
+        self.remote.read_range(range).await
+    }
+
+    async fn read(&self) -> Result<Bytes, SlateDBError> {
+        self.remote.read().await
+    }
 }
 
 impl WalFileHandle {
@@ -229,6 +261,54 @@ impl WalTableStore {
         index: Arc<SsTableIndexOwned>,
         blocks: Range<usize>,
     ) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
+        self.read_blocks_with_prefetch(handle, index, blocks, None)
+            .await
+    }
+
+    /// Reads only a whole-block prefix that fits the supplied encoded-byte cap.
+    /// An oversized first block remains demand-read rather than exceeding it.
+    pub(crate) async fn prefetch_initial_blocks(
+        &self,
+        handle: &WalFileHandle,
+        index: &SsTableIndexOwned,
+        max_bytes: usize,
+    ) -> Result<Option<PrefetchedWalBlocks>, SlateDBError> {
+        if max_bytes == 0 || index.borrow().block_meta().is_empty() {
+            return Ok(None);
+        }
+        let mut blocks = self.block_range_for_target_bytes(handle, index, 0, max_bytes);
+        if self.block_range_size(handle, index, blocks.clone()) > max_bytes {
+            blocks.end -= 1;
+        }
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let range = self
+            .sst_format
+            .block_range(blocks.clone(), &handle.info, &index.borrow());
+        let obj = ReadOnlyObject {
+            object_store: Arc::clone(&self.object_store),
+            path: self.path(handle.id.value()),
+            tag: ObjectStoreCallTag::new(self.kind, SstType::Wal),
+        };
+        let bytes = obj
+            .read_range(range.clone())
+            .await
+            .map_err(|e| e.with_path(&obj.path))?;
+        Ok(Some(PrefetchedWalBlocks {
+            blocks,
+            range,
+            bytes,
+        }))
+    }
+
+    pub(crate) async fn read_blocks_with_prefetch(
+        &self,
+        handle: &WalFileHandle,
+        index: Arc<SsTableIndexOwned>,
+        blocks: Range<usize>,
+        prefetched: Option<&PrefetchedWalBlocks>,
+    ) -> Result<VecDeque<Arc<Block>>, SlateDBError> {
         let object_store = Arc::clone(&self.object_store);
         let path = self.path(handle.id.value());
         let index = &index;
@@ -241,8 +321,14 @@ impl WalTableStore {
                 };
                 let blocks = blocks.clone();
                 async move {
+                    let blob = PrefetchedWalBlob {
+                        remote: &obj,
+                        // A validation retry must fetch again and propagate its
+                        // cache-invalidation tag, never reuse corrupt prefetched bytes.
+                        prefetched: prefetched.filter(|_| tag.retry.is_none()),
+                    };
                     self.sst_format
-                        .read_blocks(&handle.info, index, blocks, &obj)
+                        .read_blocks(&handle.info, index, blocks, &blob)
                         .await
                         .map_err(|error| error.with_path(&obj.path))
                 }
@@ -443,5 +529,43 @@ mod tests {
             store.write_sst(1, &encoded).await,
             Err(SlateDBError::Fenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_prefetched_bytes_retry_from_the_object_store() {
+        let store = test_store();
+        let mut builder = store.table_builder();
+        builder
+            .add(RowEntry::new_value(b"key", b"value", 1))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let handle = store.write_sst(1, &encoded).await.unwrap();
+        let index = store.read_index(&handle).await.unwrap();
+        let mut prefetched = store
+            .prefetch_initial_blocks(&handle, &index, 1024 * 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut corrupt = prefetched.bytes.to_vec();
+        corrupt[0] ^= 1;
+        prefetched.bytes = Bytes::from(corrupt);
+        let actual = store
+            .read_blocks_with_prefetch(
+                &handle,
+                index.clone(),
+                prefetched.blocks.clone(),
+                Some(&prefetched),
+            )
+            .await
+            .unwrap();
+        let expected = store
+            .read_blocks_using_index(&handle, index, prefetched.blocks.clone())
+            .await
+            .unwrap();
+        assert!(
+            actual == expected,
+            "validation retry reused corrupted prefetched payload bytes"
+        );
     }
 }
