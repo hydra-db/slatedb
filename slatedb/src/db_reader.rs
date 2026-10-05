@@ -4040,8 +4040,9 @@ mod tests {
     }
 
     /// Regression test for #2003: read-ahead was a fixed 1MiB, so a large WAL took one
-    /// GET per MiB. It now covers a whole WAL SST, so reads for one file stay a small
-    /// constant instead of growing with size.
+    /// GET per MiB. Demand read-ahead covers a whole WAL SST, and bounded
+    /// speculative prefetch can add one prefix read, so reads for one file stay
+    /// a small constant instead of growing with size.
     #[tokio::test]
     async fn replay_reads_a_large_wal_sst_in_a_bounded_number_of_requests() {
         let recording_store = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
@@ -4053,7 +4054,8 @@ mod tests {
         let wal_store = test_provider.wal_store();
 
         // One 16MiB WAL SST, far over the old 1MiB window. The old window read it in
-        // ~16 data GETs; the fix reads it in one.
+        // ~16 data GETs; demand read-ahead needs one, plus at most one
+        // speculative prefix GET when the whole file exceeds its byte budget.
         let value = vec![b'x'; 4096];
         let entries: Vec<RowEntry> = (0..4096u32)
             .map(|i| RowEntry::new_value(format!("key-{i:08}").as_bytes(), &value, i as u64 + 1))
@@ -4080,10 +4082,11 @@ mod tests {
             .into_iter()
             .filter(|sst_type| *sst_type == Some(SstType::Wal))
             .count();
-        // Footer, index, and one data read. The old 1MiB window needed ~16 data reads
-        // for this file, so the bound is the regression.
+        // Footer, metadata, index, and at most two data reads (bounded prefix
+        // then remainder). The old 1MiB window needed ~16 data reads, so retain
+        // a fixed bound that does not scale with the WAL's size.
         assert!(
-            wal_reads <= 4,
+            wal_reads <= 5,
             "expected a bounded number of WAL reads for one file, got {wal_reads}"
         );
     }

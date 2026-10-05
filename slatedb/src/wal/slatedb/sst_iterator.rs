@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use super::store::{WalFileHandle, WalTableStore};
+use super::store::{PrefetchedWalBlocks, WalFileHandle, WalTableStore};
 use crate::block_iterator::DataBlockIterator;
 use crate::config::SstBlockSize;
 use crate::error::SlateDBError;
@@ -30,7 +30,8 @@ impl Default for WalSstIteratorOptions {
 ///
 /// WAL replay only performs whole-file scans, so this iterator deliberately has
 /// no range/view abstraction, filters, cache controls, descending mode, seek,
-/// or speculative fetch scheduling.
+/// or independent speculative fetch scheduling. The WAL-file queue can
+/// prefetch a bounded encoded prefix; only the current file is decompressed.
 pub(crate) struct WalSstIterator {
     table: WalFileHandle,
     index: Arc<SsTableIndexOwned>,
@@ -39,6 +40,7 @@ pub(crate) struct WalSstIterator {
     fetched_blocks: VecDeque<Arc<Block>>,
     table_store: Arc<WalTableStore>,
     options: WalSstIteratorOptions,
+    prefetched: Option<PrefetchedWalBlocks>,
 }
 
 impl WalSstIterator {
@@ -57,7 +59,23 @@ impl WalSstIterator {
             fetched_blocks: VecDeque::new(),
             table_store,
             options,
+            prefetched: None,
         })
+    }
+
+    pub(crate) async fn prefetch_initial_blocks(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<(), SlateDBError> {
+        self.prefetched = self
+            .table_store
+            .prefetch_initial_blocks(
+                &self.table,
+                &self.index,
+                max_bytes.min(self.options.target_bytes_to_fetch),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Returns the next WAL row in ascending sequence order.
@@ -91,21 +109,30 @@ impl WalSstIterator {
                 return Ok(false);
             }
 
-            let blocks = self.table_store.block_range_for_target_bytes(
-                &self.table,
-                &self.index,
-                self.next_block_idx_to_fetch,
-                self.options.target_bytes_to_fetch,
-            );
+            let blocks = match &self.prefetched {
+                Some(prefetched) => prefetched.blocks.clone(),
+                None => self.table_store.block_range_for_target_bytes(
+                    &self.table,
+                    &self.index,
+                    self.next_block_idx_to_fetch,
+                    self.options.target_bytes_to_fetch,
+                ),
+            };
             let next_block_idx_to_fetch = blocks.end;
             let fetched_blocks = self
                 .table_store
-                .read_blocks_using_index(&self.table, Arc::clone(&self.index), blocks)
+                .read_blocks_with_prefetch(
+                    &self.table,
+                    Arc::clone(&self.index),
+                    blocks,
+                    self.prefetched.as_ref(),
+                )
                 .await?;
             // Commit the cursor only after the read succeeds so cancelling the
             // read future cannot cause the next call to skip these blocks.
             self.next_block_idx_to_fetch = next_block_idx_to_fetch;
             self.fetched_blocks = fetched_blocks;
+            self.prefetched = None;
         }
     }
 }
@@ -167,5 +194,53 @@ mod tests {
         }
         assert_eq!(actual, rows);
         assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_prefix_prefetch_keeps_the_rest_of_a_large_wal() {
+        let store = test_store();
+        let mut builder =
+            EncodedWalSsTableBuilder::new(64, Box::new(FlatBufferSsTableInfoCodec {}));
+        let rows = (1..=20)
+            .map(|seq| RowEntry::new_value(format!("key-{seq:02}").as_bytes(), &[b'x'; 64], seq))
+            .collect::<Vec<_>>();
+        for row in rows.iter().cloned() {
+            builder.add(row).await.unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let table = store.write_sst(1, &encoded).await.unwrap();
+        let mut iter = WalSstIterator::new(
+            table.clone(),
+            store.clone(),
+            WalSstIteratorOptions {
+                target_bytes_to_fetch: 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap();
+        let first_block_size = store.block_range_size(&table, &iter.index, 0..1);
+        let cap = first_block_size * 2;
+        iter.prefetch_initial_blocks(cap).await.unwrap();
+        let prefix = iter.prefetched.as_ref().unwrap();
+        assert!(store.block_range_size(&table, &iter.index, prefix.blocks.clone()) <= cap);
+        assert!(prefix.blocks.end < iter.index.borrow().block_meta().len());
+        let mut actual = Vec::new();
+        while let Some(row) = iter.next().await.unwrap() {
+            actual.push(row);
+        }
+        assert_eq!(actual, rows);
+
+        let mut oversized = WalSstIterator::new(table, store, WalSstIteratorOptions::default())
+            .await
+            .unwrap();
+        oversized
+            .prefetch_initial_blocks(first_block_size - 1)
+            .await
+            .unwrap();
+        assert!(
+            oversized.prefetched.is_none(),
+            "an oversized block must not exceed the speculative budget"
+        );
+        assert_eq!(oversized.next().await.unwrap(), Some(rows[0].clone()));
     }
 }

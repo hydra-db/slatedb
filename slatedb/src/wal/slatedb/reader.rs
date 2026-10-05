@@ -20,7 +20,8 @@ use crate::wal::{WalError, WalFileRange, WalIterator, WalReader};
 
 #[derive(Clone, Debug)]
 pub struct SlateDbWalReaderOptions {
-    /// The number of WAL SST handles to preload while replaying.
+    /// The number of WAL SST handles and bounded encoded payload prefixes to
+    /// preload while replaying. Rows are still decoded and returned in order.
     pub sst_batch_size: usize,
 
     /// Retained for compatibility with the existing WAL reader configuration.
@@ -28,7 +29,8 @@ pub struct SlateDbWalReaderOptions {
 
     /// The target number of bytes to fetch in a single request while iterating over WAL SSTs.
     /// Each fetch reads enough whole blocks to meet this target or reach the end of the file.
-    /// The default is 1 MiB.
+    /// The default is 64 MiB. Speculative prefix fetches additionally share a
+    /// 4 MiB encoded-byte budget across the queue and its current file.
     pub read_ahead_bytes: usize,
 }
 
