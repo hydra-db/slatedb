@@ -23,7 +23,11 @@ impl<'a> MergeIteratorHeapEntry<'a> {
         mut self,
         next_key: &[u8],
     ) -> Result<Option<MergeIteratorHeapEntry<'a>>, SlateDBError> {
-        if self.next_kv.key >= next_key {
+        let at_or_past_target = match self.order {
+            IterationOrder::Ascending => self.next_kv.key.as_ref() >= next_key,
+            IterationOrder::Descending => self.next_kv.key.as_ref() <= next_key,
+        };
+        if at_or_past_target {
             Ok(Some(self))
         } else {
             self.iterator.seek(next_key).await?;
@@ -257,6 +261,7 @@ impl TrackedRowEntryIterator for MergeIterator<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::batch::{WriteBatch, WriteBatchIterator};
     use crate::error::SlateDBError;
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::merge_iterator::{MergeIterator, MAX_MERGE_INIT_CONCURRENCY};
@@ -651,6 +656,38 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_merge_iterator_descending_seek_skips_current_and_heap_heads() {
+        let mut first = WriteBatch::new();
+        let mut second = WriteBatch::new();
+        for key in [b"a", b"c", b"e", b"g"] {
+            first.put(key, b"value");
+        }
+        for key in [b"b", b"d", b"f", b"h"] {
+            second.put(key, b"value");
+        }
+        for dedup in [true, false] {
+            let sources = [&first, &second].map(|batch| {
+                WriteBatchIterator::new(batch, .., IterationOrder::Descending, u64::MAX, None, None)
+            });
+            let mut iter = MergeIterator::new_with_order(sources, IterationOrder::Descending)
+                .unwrap()
+                .with_dedup(dedup);
+            iter.init().await.unwrap();
+            // Both source heads need to move, including the one held as
+            // current outside the heap. Test before and after returning rows.
+            iter.seek(b"f").await.unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"f");
+            iter.seek(b"d").await.unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"d");
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
+            iter.seek(b"aa").await.unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"a");
+            iter.seek(b"0").await.unwrap();
+            assert!(iter.next().await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]
