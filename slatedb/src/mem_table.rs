@@ -209,8 +209,18 @@ impl RowEntryIterator for MemTableIterator {
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         loop {
-            let front = self.borrow_item().clone();
-            if front.is_some_and(|record| record.key < next_key) {
+            let before_target = match self.borrow_ordering() {
+                IterationOrder::Ascending => self
+                    .borrow_item()
+                    .as_ref()
+                    .is_some_and(|row| row.key.as_ref() < next_key),
+                IterationOrder::Descending => self
+                    .borrow_descending_stack()
+                    .last()
+                    .or(self.borrow_item().as_ref())
+                    .is_some_and(|row| row.key.as_ref() > next_key),
+            };
+            if before_target {
                 self.next_sync();
                 // Keep in-memory seeking cooperative.
                 tokio::task::coop::consume_budget().await;
@@ -1113,6 +1123,30 @@ mod tests {
         // then
         assert!(filtered.table().touched_segments().is_empty());
         assert_eq!(surviving_keys(&filtered), vec![Bytes::from_static(b"b1")]);
+    }
+
+    #[tokio::test]
+    async fn test_memtable_descending_seek_skips_buffered_version_groups() {
+        let table = WritableKVTable::new();
+        for key in [b"a", b"b", b"c", b"d"] {
+            for seq in [1, 2] {
+                table.put(RowEntry::new_value(key, b"value", seq));
+            }
+        }
+        for read_first in [true, false] {
+            let mut iter = table.table().range(.., IterationOrder::Descending);
+            if read_first {
+                assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"d");
+            }
+            iter.seek(b"b").await.unwrap();
+            for seq in [2, 1] {
+                let row = iter.next().await.unwrap().unwrap();
+                assert_eq!((row.key.as_ref(), row.seq), (b"b".as_slice(), seq));
+                iter.seek(b"b").await.unwrap();
+            }
+            iter.seek(b"0").await.unwrap();
+            assert!(iter.next().await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]

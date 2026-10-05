@@ -52,7 +52,9 @@ async def test_reader_build_fails_when_database_is_missing() -> None:
 
     with pytest.raises(Error.Data) as exc:
         await builder.build()
-    assert "failed to find latest transactional object" in exc.value.message
+    assert exc.value.message == (
+        f"Database missing error: no database initialized at object-store path {TEST_DB_PATH}"
+    )
 
 
 @pytest.mark.asyncio

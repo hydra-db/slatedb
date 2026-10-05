@@ -214,6 +214,11 @@ pub(crate) enum SlateDBError {
     SeekKeyLessThanLastReturnedKey,
 
     #[error(
+        "cannot seek to a key greater than or equal to the last returned key in descending order"
+    )]
+    SeekKeyGreaterThanLastReturnedKey,
+
+    #[error(
         "parent path must be different from the clone's path. parent_path=`{0}`, clone_path=`{0}`"
     )]
     IdenticalClonePaths(Path),
@@ -693,6 +698,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
+            SlateDBError::SeekKeyGreaterThanLastReturnedKey => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
             SlateDBError::DuplicatedCloneSourcePath(_) => Error::invalid(msg),
             SlateDBError::InvalidCloneSourceWithWal { .. } => Error::invalid(msg),

@@ -180,6 +180,7 @@ impl RowEntryIterator for ScanIterator {
 
 pub struct DbIterator {
     range: BytesRange,
+    order: IterationOrder,
     iter: Box<dyn RowEntryIterator + 'static>,
     invalidated_error: Option<SlateDBError>,
     last_key: Option<Bytes>,
@@ -232,15 +233,18 @@ impl DbIterator {
         };
 
         if let Some(merge_operator) = merge_operator {
-            iter = Box::new(MergeOperatorIterator::new(
-                merge_operator,
-                iter,
-                true,
-                // Its important not to set a snapshot seq num barrier for this merge iterator
-                // The entries in the write batch iterator have seq num u64::MAX and any merges
-                // there need to be merged with the entries from the other iterators.
-                None,
-            ));
+            iter = Box::new(
+                MergeOperatorIterator::new(
+                    merge_operator,
+                    iter,
+                    true,
+                    // Its important not to set a snapshot seq num barrier for this merge iterator
+                    // The entries in the write batch iterator have seq num u64::MAX and any merges
+                    // there need to be merged with the entries from the other iterators.
+                    None,
+                )
+                .with_order(order),
+            );
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
@@ -250,6 +254,7 @@ impl DbIterator {
 
         Ok(DbIterator {
             range,
+            order,
             iter,
             invalidated_error: None,
             last_key: None,
@@ -312,20 +317,20 @@ impl DbIterator {
         result
     }
 
-    /// Seek ahead to the next key. The next key must be larger than the
-    /// last key returned by the iterator and less than the end bound specified
-    /// in the `scan` arguments.
+    /// Seek ahead in iteration order to a key inside the original scan range.
+    /// The key must be larger than the last returned key for ascending scans,
+    /// or smaller for descending scans.
     ///
     /// After a successful seek, the iterator will return the next record
-    /// with a key greater than or equal to `next_key`.
+    /// with a key greater than or equal to `next_key` for ascending scans,
+    /// or less than or equal to it for descending scans.
     ///
     /// # Errors
     ///
     /// Returns an invalid argument error in the following cases:
     ///
     /// - if `next_key` comes before the current iterator position
-    /// - if `next_key` is beyond the upper bound specified in the original
-    ///   [`crate::db::Db::scan`] parameters
+    /// - if `next_key` is outside the original [`crate::db::Db::scan`] range
     ///
     /// Returns [`Error`] if the iterator has been invalidated in order to reclaim resources.
     pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), crate::Error> {
@@ -341,9 +346,16 @@ impl DbIterator {
         } else if self
             .last_key
             .clone()
-            .is_some_and(|last_key| next_key <= last_key)
+            .is_some_and(|last_key| match self.order {
+                IterationOrder::Ascending => next_key <= last_key,
+                IterationOrder::Descending => next_key >= last_key,
+            })
         {
-            Err(SlateDBError::SeekKeyLessThanLastReturnedKey.into())
+            Err(match self.order {
+                IterationOrder::Ascending => SlateDBError::SeekKeyLessThanLastReturnedKey,
+                IterationOrder::Descending => SlateDBError::SeekKeyGreaterThanLastReturnedKey,
+            }
+            .into())
         } else {
             let result = self.iter.seek(next_key).await;
             self.maybe_invalidate(result).map_err(Into::into)
@@ -558,6 +570,73 @@ mod tests {
         iter.seek(b"key2").await.unwrap();
         let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key, Bytes::from_static(b"key2"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_descending_seek_cannot_rewind() {
+        let mut batch = WriteBatch::new();
+        for key in [b"a", b"b", b"c", b"d"] {
+            batch.put(key, b"value");
+        }
+        let range = BytesRange::from_ref("b"..="d");
+        let batch_iter = WriteBatchIterator::new(
+            &batch,
+            range.clone(),
+            IterationOrder::Descending,
+            u64::MAX,
+            None,
+            None,
+        );
+        let mut iter = DbIterator::new(
+            range,
+            Some(batch_iter),
+            Vec::<Box<dyn RowEntryIterator>>::new(),
+            Box::new(EmptyIterator::new()),
+            None,
+            None,
+            IterationOrder::Descending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"d");
+        for key in [b"d", b"e"] {
+            assert!(iter.seek(key).await.is_err());
+        }
+        iter.seek(b"c").await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
+        assert!(iter.seek(b"c").await.is_err());
+        assert!(iter.seek(b"d").await.is_err());
+        assert!(iter.seek(b"a").await.is_err());
+        iter.seek(b"b").await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"b");
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_descending_seek_skips_intermediate_buffered_keys() {
+        let mut batch = WriteBatch::new();
+        for key in [b"a", b"b", b"c", b"d"] {
+            batch.put(key, b"value");
+        }
+        let batch_iter =
+            WriteBatchIterator::new(&batch, .., IterationOrder::Descending, u64::MAX, None, None);
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            Some(batch_iter),
+            Vec::<Box<dyn RowEntryIterator>>::new(),
+            Box::new(EmptyIterator::new()),
+            None,
+            None,
+            IterationOrder::Descending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"d");
+        iter.seek(b"b").await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"b");
+        iter.seek(b"a").await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"a");
         assert!(iter.next().await.unwrap().is_none());
     }
 

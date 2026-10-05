@@ -67,7 +67,10 @@ test("reader build fails when database is missing", async (t) => {
   const builder = cleanup.track(new DbReaderBuilder(TEST_DB_PATH, store), { shutdown: false });
 
   const error = await expectError(() => builder.build(), ErrorData);
-  assert.match(error.message, /failed to find latest transactional object/);
+  assert.equal(
+    error.message,
+    `Database missing error: no database initialized at object-store path ${TEST_DB_PATH}`,
+  );
 });
 
 test("reader point reads", async (t) => {

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     error::SlateDBError,
-    iter::{RowEntryIterator, TrackedRowEntryIterator},
+    iter::{IterationOrder, RowEntryIterator, TrackedRowEntryIterator},
     types::{RowEntry, ValueDeletable},
     utils::merge_options,
 };
@@ -244,6 +244,7 @@ pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     delegate: T,
     /// Entry from the delegate that we've peeked ahead and buffered.
     buffered_entry: Option<RowEntry>,
+    order: IterationOrder,
     /// Whether to merge entries with different expire timestamps.
     merge_different_expire_ts: bool,
     /// A barrier sequence number that supports snapshot reads using this iterator. If not None,
@@ -315,9 +316,15 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             merge_operator,
             delegate,
             buffered_entry: None,
+            order: IterationOrder::Ascending,
             merge_different_expire_ts,
             snapshot_barrier_seq,
         }
+    }
+
+    pub(crate) fn with_order(mut self, order: IterationOrder) -> Self {
+        self.order = order;
+        self
     }
 }
 
@@ -479,6 +486,16 @@ impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorIterator<T> {
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        if self
+            .buffered_entry
+            .as_ref()
+            .is_some_and(|entry| match self.order {
+                IterationOrder::Ascending => entry.key.as_ref() >= next_key,
+                IterationOrder::Descending => entry.key.as_ref() <= next_key,
+            })
+        {
+            return Ok(());
+        }
         self.buffered_entry = None;
         self.delegate.seek(next_key).await
     }
@@ -502,6 +519,38 @@ mod tests {
     use super::*;
 
     struct MockMergeOperator;
+
+    #[tokio::test]
+    async fn test_merge_operator_seek_preserves_or_skips_read_ahead_in_both_directions() {
+        for order in [IterationOrder::Ascending, IterationOrder::Descending] {
+            let first = match order {
+                IterationOrder::Ascending => b"a",
+                IterationOrder::Descending => b"d",
+            };
+            for target in [b"b", b"c"] {
+                let table = crate::mem_table::WritableKVTable::new();
+                for key in [b"a", b"b", b"c", b"d"] {
+                    if key != first {
+                        table.put(RowEntry::new_value(key, b"value", 1));
+                    }
+                }
+                // No base value: resolving this operand reads the following
+                // key into buffered_entry, outside the underlying iterator.
+                table.put(RowEntry::new_merge(first, b"operand", 2));
+                let mut iter = MergeOperatorIterator::new(
+                    Arc::new(MockMergeOperator),
+                    table.table().range(.., order),
+                    true,
+                    None,
+                )
+                .with_order(order);
+                iter.init().await.unwrap();
+                assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), first);
+                iter.seek(target).await.unwrap();
+                assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), target);
+            }
+        }
+    }
 
     impl MergeOperator for MockMergeOperator {
         fn merge(

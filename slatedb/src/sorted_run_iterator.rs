@@ -2,7 +2,7 @@ use crate::bytes_range::BytesRange;
 use crate::db_state::{SortedRun, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::iter::RowEntryIterator;
+use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::sst_iter::{SstIterator, SstIteratorOptions, SstView};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
@@ -26,16 +26,22 @@ impl<'a> SortedRunView<'a> {
     /// view range. Projected tables (e.g. in cloned manifests) may have a
     /// `visible_range` narrower than the requested range; tables whose view
     /// range does not intersect the requested range are skipped entirely.
-    fn pop_sst(&mut self) -> Option<SstView<'a>> {
+    fn pop_sst(&mut self, order: IterationOrder) -> Option<SstView<'a>> {
         match self {
             SortedRunView::Owned(tables, r) => loop {
-                let table = tables.pop_front()?;
+                let table = match order {
+                    IterationOrder::Ascending => tables.pop_front(),
+                    IterationOrder::Descending => tables.pop_back(),
+                }?;
                 if let Some(view_range) = table.calculate_view_range(r.clone()) {
                     return Some(SstView::Owned(Box::new(table), view_range));
                 }
             },
             SortedRunView::Borrowed(tables, r) => loop {
-                let table = tables.pop_front()?;
+                let table = match order {
+                    IterationOrder::Ascending => tables.pop_front(),
+                    IterationOrder::Descending => tables.pop_back(),
+                }?;
                 if let Some(view_range) = table.calculate_view_range(BytesRange::from_slice(*r)) {
                     return Some(SstView::Borrowed(table, view_range));
                 }
@@ -49,7 +55,7 @@ impl<'a> SortedRunView<'a> {
         sst_iterator_options: SstIteratorOptions,
         db_stats: Option<DbStats>,
     ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
-        let next_iter = if let Some(view) = self.pop_sst() {
+        let next_iter = if let Some(view) = self.pop_sst(sst_iterator_options.order) {
             Some(SstIterator::new_with_stats(
                 view,
                 table_store,
@@ -77,6 +83,8 @@ pub(crate) struct SortedRunIterator<'a> {
     view: SortedRunView<'a>,
     current_iter: Option<SstIterator<'a>>,
     initialized: bool,
+    descending_buffer: VecDeque<RowEntry>,
+    pending_entry: Option<RowEntry>,
 }
 
 impl<'a> SortedRunIterator<'a> {
@@ -93,6 +101,8 @@ impl<'a> SortedRunIterator<'a> {
             view,
             current_iter: None,
             initialized: false,
+            descending_buffer: VecDeque::new(),
+            pending_entry: None,
         };
         res.advance_table().await?;
         Ok(res)
@@ -199,6 +209,45 @@ impl<'a> SortedRunIterator<'a> {
         }
         Ok(())
     }
+
+    async fn next_raw(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        while let Some(iter) = &mut self.current_iter {
+            if let Some(row) = iter.next().await? {
+                return Ok(Some(row));
+            }
+            self.advance_table().await?;
+        }
+        Ok(None)
+    }
+
+    async fn next_descending(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        if let Some(row) = self.descending_buffer.pop_front() {
+            return Ok(Some(row));
+        }
+        let first = match self.pending_entry.take() {
+            Some(row) => Some(row),
+            None => self.next_raw().await?,
+        };
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        let key = first.key.clone();
+        let mut versions = vec![first];
+        while let Some(row) = self.next_raw().await? {
+            if row.key == key {
+                versions.push(row);
+            } else {
+                self.pending_entry = Some(row);
+                break;
+            }
+        }
+        // Historical runs can split a version group across adjacent SSTs.
+        // Reversing file traversal must not reverse sequence precedence:
+        // snapshot filtering and merge operands still need newest seq first.
+        versions.sort_by(|a, b| b.seq.cmp(&a.seq));
+        self.descending_buffer.extend(versions);
+        Ok(self.descending_buffer.pop_front())
+    }
 }
 
 #[async_trait]
@@ -217,25 +266,53 @@ impl RowEntryIterator for SortedRunIterator<'_> {
         if !self.initialized {
             return Err(SlateDBError::IteratorNotInitialized);
         }
-        while let Some(iter) = &mut self.current_iter {
-            if let Some(kv) = iter.next().await? {
-                return Ok(Some(kv));
-            } else {
-                self.advance_table().await?;
-            }
+        match self.sst_iter_options.order {
+            IterationOrder::Ascending => self.next_raw().await,
+            IterationOrder::Descending => self.next_descending().await,
         }
-        Ok(None)
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         if !self.initialized {
             return Err(SlateDBError::IteratorNotInitialized);
         }
-        while let Some(next_table) = self.view.peek_next_table() {
-            if next_table.compacted_effective_start_key() < next_key {
-                self.advance_table().await?;
-            } else {
-                break;
+        match self.sst_iter_options.order {
+            IterationOrder::Ascending => {
+                while let Some(next_table) = self.view.peek_next_table() {
+                    if next_table.compacted_effective_start_key() < next_key {
+                        self.advance_table().await?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            IterationOrder::Descending => {
+                while self
+                    .descending_buffer
+                    .front()
+                    .is_some_and(|row| row.key.as_ref() > next_key)
+                {
+                    self.descending_buffer.pop_front();
+                }
+                if !self.descending_buffer.is_empty()
+                    || self
+                        .pending_entry
+                        .as_ref()
+                        .is_some_and(|row| row.key.as_ref() <= next_key)
+                {
+                    return Ok(());
+                }
+                self.pending_entry = None;
+                // Skip tables whose entire visible range is above the seek
+                // key. Comparing the *next* table's start would miss seeks
+                // into that table (or into the gap immediately above it).
+                while self
+                    .current_iter
+                    .as_ref()
+                    .is_some_and(|iter| iter.key_precedes_view(next_key))
+                {
+                    self.advance_table().await?;
+                }
             }
         }
         if let Some(iter) = &mut self.current_iter {
@@ -252,6 +329,7 @@ mod tests {
     use crate::bytes_generator::OrderedBytesGenerator;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::format::sst::SsTableFormat;
+    use crate::iter::IterationOrder;
     use crate::proptest_util;
     use crate::proptest_util::sample;
     use crate::tablestore::TableStoreKind;
@@ -267,6 +345,416 @@ mod tests {
     use rand::Rng;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    // Three SSTs with gaps, multiple blocks and multiple versions per key.
+    async fn direction_fixture() -> (Arc<TableStore>, SortedRun) {
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(Arc::new(InMemory::new()), None),
+            SsTableFormat {
+                block_size: 64,
+                ..SsTableFormat::default()
+            },
+            Path::from("direction-fixture"),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let mut views = Vec::new();
+        for start in [1, 7, 13] {
+            let mut builder = table_store.table_builder();
+            for number in start..start + 4 {
+                let key = format!("key{number:02}");
+                for seq in [2, 1] {
+                    builder
+                        .add(RowEntry::new_value(key.as_bytes(), b"value", seq))
+                        .await
+                        .unwrap();
+                }
+            }
+            let encoded = builder.build().await.unwrap();
+            let handle = table_store
+                .write_sst(&SsTableId::Compacted(ulid::Ulid::new()), &encoded)
+                .await
+                .unwrap();
+            views.push(SsTableView::identity(handle));
+        }
+        (table_store, SortedRun::new(0, views))
+    }
+
+    async fn direction_iter<'a>(
+        range: &'a BytesRange,
+        run: &'a SortedRun,
+        store: Arc<TableStore>,
+        order: IterationOrder,
+        owned: bool,
+    ) -> SortedRunIterator<'a> {
+        let options = SstIteratorOptions {
+            order,
+            ..SstIteratorOptions::default()
+        };
+        if owned {
+            SortedRunIterator::new_owned_initialized(range.clone(), run.clone(), store, options)
+                .await
+                .unwrap()
+        } else {
+            let bounds = (
+                range.start_bound().map(|k| k.as_ref()),
+                range.end_bound().map(|k| k.as_ref()),
+            );
+            SortedRunIterator::new_borrowed_initialized(bounds, run, store, options)
+                .await
+                .unwrap()
+        }
+    }
+
+    fn direction_expected(range: &BytesRange, order: IterationOrder) -> Vec<(Bytes, u64)> {
+        let mut keys = [1, 2, 3, 4, 7, 8, 9, 10, 13, 14, 15, 16]
+            .map(|n| Bytes::from(format!("key{n:02}")))
+            .to_vec();
+        if matches!(order, IterationOrder::Descending) {
+            keys.reverse();
+        }
+        keys.into_iter()
+            .filter(|k| range.contains(k))
+            .flat_map(|k| [(k.clone(), 2), (k, 1)])
+            .collect()
+    }
+
+    async fn direction_drain(iter: &mut SortedRunIterator<'_>) -> Vec<(Bytes, u64)> {
+        let mut rows = Vec::new();
+        while let Some(row) = iter.next().await.unwrap() {
+            rows.push((row.key, row.seq));
+        }
+        assert!(iter.next().await.unwrap().is_none());
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_direction_ranges_and_versions() {
+        let (store, run) = direction_fixture().await;
+        let ranges = [
+            BytesRange::from(..),
+            BytesRange::from_ref("key04"..="key13"),
+            BytesRange::from_ref("key04".."key13"),
+            BytesRange::new(
+                Bound::Excluded(Bytes::from("key04")),
+                Bound::Excluded(Bytes::from("key13")),
+            ),
+            BytesRange::from_ref("key07"..="key07"),
+            BytesRange::from_ref("key05"..="key06"),
+            BytesRange::from_ref("key00"..="key00"),
+            BytesRange::from_ref("key18"..),
+        ];
+        for range in &ranges {
+            for order in [IterationOrder::Ascending, IterationOrder::Descending] {
+                for owned in [true, false] {
+                    let mut iter = direction_iter(range, &run, store.clone(), order, owned).await;
+                    assert_eq!(
+                        direction_drain(&mut iter).await,
+                        direction_expected(range, order),
+                        "range={range:?}, order={order:?}, owned={owned}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_direction_seek_into_tables_gaps_and_bounds() {
+        let (store, run) = direction_fixture().await;
+        let range = BytesRange::from_ref("key02"..="key15");
+        for order in [IterationOrder::Ascending, IterationOrder::Descending] {
+            for owned in [true, false] {
+                // Stay inside the requested range, but include SST gaps and
+                // exact file-start/file-end keys. A seek must be inclusive.
+                for number in 2..=15 {
+                    let key = Bytes::from(format!("key{number:02}"));
+                    let mut iter = direction_iter(&range, &run, store.clone(), order, owned).await;
+                    iter.seek(&key).await.unwrap();
+                    let expected = direction_expected(&range, order)
+                        .into_iter()
+                        .filter(|(k, _)| match order {
+                            IterationOrder::Ascending => k >= &key,
+                            IterationOrder::Descending => k <= &key,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        direction_drain(&mut iter).await,
+                        expected,
+                        "seek={key:?}, order={order:?}, owned={owned}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_seek_after_read_ahead() {
+        let (store, run) = direction_fixture().await;
+        let range = BytesRange::from(..);
+        for owned in [true, false] {
+            let mut iter = direction_iter(
+                &range,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            let first = iter.next().await.unwrap().unwrap();
+            assert_eq!((first.key, first.seq), (Bytes::from("key16"), 2));
+            // Preserve the unconsumed version of the same key, then skip the
+            // next buffered group, cross an SST gap and seek below the run.
+            iter.seek(b"key16").await.unwrap();
+            let second = iter.next().await.unwrap().unwrap();
+            assert_eq!((second.key, second.seq), (Bytes::from("key16"), 1));
+            for key in ["key14", "key11", "key08", "key05", "key01"] {
+                iter.seek(key.as_bytes()).await.unwrap();
+                let row = iter.next().await.unwrap().unwrap();
+                let expected_key = direction_expected(&range, IterationOrder::Descending)
+                    .into_iter()
+                    .find(|(k, _)| k.as_ref() <= key.as_bytes())
+                    .unwrap()
+                    .0;
+                assert_eq!((row.key, row.seq), (expected_key, 2));
+            }
+            iter.seek(b"key00").await.unwrap();
+            assert!(iter.next().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_projected_ranges() {
+        let (store, run) = direction_fixture().await;
+        let views = run
+            .sst_views()
+            .iter()
+            .zip([("key02", "key04"), ("key08", "key10"), ("key14", "key16")])
+            .map(|(view, (lo, hi))| {
+                SsTableView::new_projected(
+                    ulid::Ulid::new(),
+                    view.sst.clone(),
+                    Some(BytesRange::from_ref(lo..hi)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected = SortedRun::new(0, views);
+        let range = BytesRange::from_ref("key03"..="key14");
+        let expected = ["key14", "key09", "key08", "key03"]
+            .into_iter()
+            .flat_map(|k| [(Bytes::from(k), 2), (Bytes::from(k), 1)])
+            .collect::<Vec<_>>();
+        for owned in [true, false] {
+            let mut iter = direction_iter(
+                &range,
+                &projected,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(direction_drain(&mut iter).await, expected);
+            let mut iter = direction_iter(
+                &range,
+                &projected,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            iter.seek(b"key13").await.unwrap();
+            assert_eq!(direction_drain(&mut iter).await, expected[2..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_empty_and_uninitialized_descending() {
+        let (store, _) = direction_fixture().await;
+        let run = SortedRun::new(0, []);
+        for owned in [true, false] {
+            let range = BytesRange::from(..);
+            let mut iter = direction_iter(
+                &range,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            iter.seek(b"key08").await.unwrap();
+            assert!(direction_drain(&mut iter).await.is_empty());
+        }
+        let mut iter = SortedRunIterator::new_owned(
+            ..,
+            run,
+            store,
+            SstIteratorOptions {
+                order: IterationOrder::Descending,
+                ..SstIteratorOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            iter.seek(b"key08").await,
+            Err(SlateDBError::IteratorNotInitialized)
+        ));
+        assert!(matches!(
+            iter.next().await,
+            Err(SlateDBError::IteratorNotInitialized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_seek_without_last_entry_metadata() {
+        let (store, run) = direction_fixture().await;
+        let run = SortedRun::new(
+            0,
+            run.sst_views().iter().map(|view| {
+                let mut handle = view.sst.clone();
+                handle.info.last_entry = None;
+                SsTableView::identity(handle)
+            }),
+        );
+        let range = BytesRange::from(..);
+        for owned in [true, false] {
+            for target in ["key14", "key11", "key07", "key05", "key00"] {
+                let mut iter = direction_iter(
+                    &range,
+                    &run,
+                    store.clone(),
+                    IterationOrder::Descending,
+                    owned,
+                )
+                .await;
+                iter.seek(target.as_bytes()).await.unwrap();
+                let expected = direction_expected(&range, IterationOrder::Descending)
+                    .into_iter()
+                    .filter(|(k, _)| k.as_ref() <= target.as_bytes())
+                    .collect::<Vec<_>>();
+                assert_eq!(direction_drain(&mut iter).await, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_versions_at_shared_sst_boundary() {
+        let (store, _) = direction_fixture().await;
+        let mut views = Vec::new();
+        for rows in [
+            vec![("a", 1), ("b", 5), ("b", 4)],
+            vec![("b", 3), ("b", 2)],
+            vec![("b", 1), ("c", 1)],
+        ] {
+            let mut builder = store.table_builder();
+            for (key, seq) in rows {
+                builder
+                    .add(RowEntry::new_value(
+                        key.as_bytes(),
+                        format!("value{seq}").as_bytes(),
+                        seq,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let encoded = builder.build().await.unwrap();
+            views.push(SsTableView::identity(
+                store
+                    .write_sst(&SsTableId::Compacted(ulid::Ulid::new()), &encoded)
+                    .await
+                    .unwrap(),
+            ));
+        }
+        let run = SortedRun::new(0, views);
+        let expected = [
+            ("c", 1),
+            ("b", 5),
+            ("b", 4),
+            ("b", 3),
+            ("b", 2),
+            ("b", 1),
+            ("a", 1),
+        ]
+        .map(|(k, seq)| (Bytes::from(k), seq))
+        .to_vec();
+        let range = BytesRange::from(..);
+        for owned in [true, false] {
+            let mut iter = direction_iter(
+                &range,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(direction_drain(&mut iter).await, expected);
+            let point = BytesRange::from_ref("b"..="b");
+            let mut iter = direction_iter(
+                &point,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(direction_drain(&mut iter).await, expected[1..6]);
+            let mut iter = direction_iter(
+                &range,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
+            iter.seek(b"b").await.unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().seq, 5);
+            iter.seek(b"b").await.unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().seq, 4);
+            iter.seek(b"a").await.unwrap();
+            assert_eq!(direction_drain(&mut iter).await, expected[6..]);
+        }
+        // Verify the public iterator's snapshot filter/dedup sees the correct
+        // version, rather than retaining the oldest SST's boundary entry.
+        for max_seq in [None, Some(3)] {
+            let raw = SortedRunIterator::new_owned_initialized(
+                ..,
+                run.clone(),
+                store.clone(),
+                SstIteratorOptions {
+                    order: IterationOrder::Descending,
+                    ..SstIteratorOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut iter = crate::db_iter::DbIterator::new(
+                range.clone(),
+                None,
+                Vec::<Box<dyn RowEntryIterator>>::new(),
+                Box::new(raw),
+                max_seq,
+                None,
+                IterationOrder::Descending,
+            )
+            .await
+            .unwrap();
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
+            let row = iter.next().await.unwrap().unwrap();
+            assert_eq!(row.key.as_ref(), b"b");
+            assert_eq!(
+                row.value.as_ref(),
+                if max_seq.is_some() {
+                    b"value3"
+                } else {
+                    b"value5"
+                }
+            );
+            assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"a");
+            assert!(iter.next().await.unwrap().is_none());
+        }
+    }
 
     #[tokio::test]
     async fn test_one_sst_sr_iter() {

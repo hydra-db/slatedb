@@ -677,6 +677,28 @@ impl RowEntryIterator for InternalSstIterator<'_> {
         if !self.state.is_initialized() {
             return Err(SlateDBError::IteratorNotInitialized);
         }
+        if let Some(buffer) = &mut self.descending_buffer {
+            // A descending next() reads a whole version group and one entry
+            // from the following key. Seek must account for that read-ahead,
+            // even when it has exhausted the underlying block iterator.
+            while buffer
+                .front()
+                .is_some_and(|entry| entry.key.as_ref() > next_key)
+            {
+                buffer.pop_front();
+            }
+            if !buffer.is_empty() {
+                return Ok(());
+            }
+            if self
+                .pending_entry
+                .as_ref()
+                .is_some_and(|entry| entry.key.as_ref() <= next_key)
+            {
+                return Ok(());
+            }
+            self.pending_entry = None;
+        }
         if !self.view.contains(next_key) {
             if self.view.key_exceeds(next_key) {
                 match self.options.order {
@@ -692,6 +714,11 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                         // the normal seek logic.
                     }
                 }
+            } else if matches!(self.options.order, IterationOrder::Descending) {
+                // Below the view's lower bound there are no remaining keys
+                // in descending order, just as above its upper bound in ASC.
+                self.stop();
+                return Ok(());
             } else {
                 return Err(SlateDBError::SeekKeyOutOfKeyRange {
                     key: next_key.to_vec(),
@@ -845,6 +872,25 @@ pub(crate) struct SstIterator<'a> {
 }
 
 impl<'a> SstIterator<'a> {
+    pub(crate) fn key_precedes_view(&self, key: &[u8]) -> bool {
+        let inner = match &self.delegate {
+            SstIteratorDelegate::Direct(inner) => inner,
+            SstIteratorDelegate::Filter(filter) => &filter.inner,
+        };
+        // Older SST metadata may omit last_entry, in which case the view
+        // range can be the whole requested range. Its physical first key is
+        // still a sound lower bound for skipping it during a descending seek.
+        inner.view().key_precedes(key)
+            || inner
+                .view()
+                .table_as_ref()
+                .sst
+                .info
+                .first_entry
+                .as_ref()
+                .is_some_and(|first| key < first.as_ref())
+    }
+
     fn from_internal(internal: InternalSstIterator<'a>, db_stats: Option<DbStats>) -> Self {
         let point_key = internal.view().point_key().map(Bytes::copy_from_slice);
         let prefix = internal.options.prefix.clone();
@@ -1787,6 +1833,92 @@ mod tests {
         test_descending_seek_beyond_last_key_with_format(BlockFormat::V1).await;
         test_descending_seek_beyond_last_key_with_format(BlockFormat::V2).await;
         test_descending_seek_beyond_last_key_with_format(BlockFormat::Latest).await;
+    }
+
+    #[tokio::test]
+    async fn test_descending_seek_respects_buffered_versions_and_pending_entry() {
+        for block_format in [BlockFormat::V1, BlockFormat::V2, BlockFormat::Latest] {
+            let table_store = Arc::new(TableStore::new(
+                ObjectStores::new(Arc::new(InMemory::new()), None),
+                SsTableFormat {
+                    block_size: 64,
+                    ..SsTableFormat::default()
+                },
+                Path::from("descending-seek"),
+                None,
+                TableStoreKind::Main,
+                BlockCachePolicy::default(),
+            ));
+            let mut builder = table_store.table_builder().with_block_format(block_format);
+            for key in [b"a", b"b", b"c"] {
+                for seq in [2, 1] {
+                    builder
+                        .add(RowEntry::new_value(key, b"value", seq))
+                        .await
+                        .unwrap();
+                }
+            }
+            let encoded = builder.build().await.unwrap();
+            let handle = table_store
+                .write_sst(&SsTableId::Compacted(ulid::Ulid::new()), &encoded)
+                .await
+                .unwrap();
+            let view = SsTableView::identity(handle);
+            for target in [b"b", b"a"] {
+                let mut iter = SstIterator::new_borrowed_initialized(
+                    ..,
+                    &view,
+                    table_store.clone(),
+                    SstIteratorOptions {
+                        order: IterationOrder::Descending,
+                        ..SstIteratorOptions::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let first = iter.next().await.unwrap().unwrap();
+                assert_eq!((first.key.as_ref(), first.seq), (b"c".as_slice(), 2));
+                iter.seek(target).await.unwrap();
+                for key in [b"b", b"a"].into_iter().filter(|k| *k <= target) {
+                    for seq in [2, 1] {
+                        let row = iter.next().await.unwrap().unwrap();
+                        assert_eq!(
+                            (row.key.as_ref(), row.seq),
+                            (key.as_slice(), seq),
+                            "format={block_format:?}"
+                        );
+                        // Inclusive seek must retain an unconsumed older
+                        // version even after the underlying stream finishes.
+                        if seq == 2 {
+                            iter.seek(key).await.unwrap();
+                        }
+                    }
+                }
+                assert!(iter.next().await.unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_descending_seek_below_projected_view_exhausts() {
+        let store = bloom_filter_enabled_table_store(10);
+        let view = build_single_block_sst(&store, &[b"a", b"b", b"c"]).await;
+        let mut iter = SstIterator::new_borrowed_initialized(
+            BytesRange::from_ref("b"..="c"),
+            &view,
+            store,
+            SstIteratorOptions {
+                order: IterationOrder::Descending,
+                ..SstIteratorOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
+        iter.seek(b"a").await.unwrap();
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     async fn test_descending_seek_beyond_last_key_with_format(block_format: BlockFormat) {
