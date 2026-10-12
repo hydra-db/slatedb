@@ -142,6 +142,59 @@ impl WriteBatch {
         }
     }
 
+    /// Conservative in-memory size used to reserve bounded commit finalization.
+    pub fn estimated_size(&self) -> usize {
+        self.ops.iter().fold(0usize, |size, (key, ops)| {
+            size.saturating_add(key.len())
+                .saturating_add(128)
+                .saturating_add(
+                    ops.iter()
+                        .map(|op| match op {
+                            WriteOp::Put(value, _) | WriteOp::Merge(value, _) => value.len() + 64,
+                            WriteOp::Delete => 64,
+                        })
+                        .sum::<usize>(),
+                )
+        })
+    }
+
+    /// Transform put keys/values while preserving their options and all deletes.
+    /// Merge batches are rejected. Key collisions are rejected, including collisions
+    /// with deletes: transformation must preserve the batch's operation identity.
+    /// On error discard the batch; a commit finalizer does so before publication.
+    pub fn try_map_puts<F>(&mut self, mut map: F) -> Result<(), crate::Error>
+    where
+        F: FnMut(Bytes, Bytes) -> Result<(Bytes, Bytes), crate::Error>,
+    {
+        if self.has_merge_ops {
+            return Err(crate::Error::invalid(
+                "put mapping does not support merges".into(),
+            ));
+        }
+        let previous = std::mem::take(&mut self.ops);
+        for (mut key, mut ops) in previous {
+            if let Some(WriteOp::Put(value, options)) = ops.pop() {
+                let (mapped_key, mapped_value) = map(key, value)?;
+                if mapped_key.is_empty()
+                    || mapped_key.len() > u16::MAX as usize
+                    || mapped_value.len() > u32::MAX as usize
+                {
+                    return Err(crate::Error::invalid(
+                        "invalid finalized key/value size".into(),
+                    ));
+                }
+                key = mapped_key;
+                ops.push(WriteOp::Put(mapped_value, options));
+            } else {
+                ops.push(WriteOp::Delete);
+            }
+            if self.ops.insert(key, ops).is_some() {
+                return Err(crate::Error::invalid("finalized keys collide".into()));
+            }
+        }
+        Ok(())
+    }
+
     fn assert_kv<K, V>(&self, key: &K, value: &V)
     where
         K: AsRef<[u8]>,
