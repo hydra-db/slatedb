@@ -281,6 +281,18 @@ impl DbInner {
         options: &WriteOptions,
         txn: Option<DbTransaction>,
     ) -> Result<WriteHandle, SlateDBError> {
+        self.submit_with_options(batch, options, txn)
+            .await?
+            .await_result()
+            .await
+    }
+
+    pub(crate) async fn submit_with_options(
+        &self,
+        batch: WriteBatch,
+        options: &WriteOptions,
+        txn: Option<DbTransaction>,
+    ) -> Result<WriteSubmission, SlateDBError> {
         self.db_stats.write_batch_count.increment(1);
         self.db_stats.write_ops.increment(batch.op_count() as u64);
         self.check_closed()?;
@@ -299,7 +311,8 @@ impl DbInner {
         self.maybe_apply_backpressure().await?;
         self.write_notifier.send(batch_msg)?;
 
-        rx.await?
+        // No suspension between enqueue and returning the submission witness.
+        Ok(WriteSubmission { result: rx })
     }
 
     #[inline]
@@ -2079,6 +2092,32 @@ impl DbCacheManagerOps for Db {
     async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
         db_cache_manager::evict_cached_sst_impl(&self.inner.table_store, sst_id).await
+    }
+}
+
+/// Witness that a write has been admitted to the database writer.
+///
+/// Admission is not application or durability. See [`Self::await_applied`].
+#[must_use = "an admitted write must be awaited or its outcome resolved separately"]
+#[derive(Debug)]
+pub struct WriteSubmission {
+    result: tokio::sync::oneshot::Receiver<Result<WriteHandle, SlateDBError>>,
+}
+
+impl WriteSubmission {
+    /// Wait for an admitted write to be applied to the WAL and memtable.
+    ///
+    /// This does not wait for object-store durability: use
+    /// [`WriteHandle::await_durable`] on the returned handle. Dropping this
+    /// submission or the wait future does not cancel the admitted write. Its
+    /// outcome may then be unknown and must be resolved by the caller's durable
+    /// request identity before retrying a non-idempotent operation.
+    pub async fn await_applied(self) -> Result<WriteHandle, crate::Error> {
+        self.await_result().await.map_err(Into::into)
+    }
+
+    async fn await_result(self) -> Result<WriteHandle, SlateDBError> {
+        self.result.await?
     }
 }
 
@@ -8731,6 +8770,176 @@ mod tests {
     /// when it finishes processing the message. Without that ownership transfer
     /// the txn would leak in active_txns, pinning min_active_seq and blocking
     /// compaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_submission_before_admission_discards_transaction() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        fail_parallel::cfg(fp_registry.clone(), "write-compacted-sst-io-error", "pause").unwrap();
+        let mut settings = test_db_options(0, 4 * 1024, None);
+        settings.flush_interval = None;
+        settings.max_unflushed_bytes = 8 * 1024;
+        let db = Db::builder(
+            "/tmp/test_cancelled_submission_before_admission_discards_transaction",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(settings)
+        .with_fp_registry(fp_registry.clone())
+        .build()
+        .await
+        .unwrap();
+        db.put(b"filler", vec![b'x'; 16 * 1024]).await.unwrap();
+        let sequence = db.inner.oracle.last_seq();
+        let transaction = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        transaction.put(b"graph", b"aborted").unwrap();
+        transaction.put(b"receipt", b"aborted").unwrap();
+
+        // Backpressure suspends before admission. Dropping this pending future
+        // must discard both the buffer and the SSI transaction registration.
+        let pending = transaction.submit().now_or_never();
+        fail_parallel::cfg(fp_registry, "write-compacted-sst-io-error", "off").unwrap();
+        assert!(pending.is_none(), "submission must suspend before enqueue");
+        assert_eq!(db.inner.txn_manager.min_active_seq(), None);
+        db.flush().await.unwrap();
+        assert_eq!(db.inner.oracle.last_seq(), sequence);
+        assert_eq!(db.get(b"graph").await.unwrap(), None);
+        assert_eq!(db.get(b"receipt").await.unwrap(), None);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dropped_admitted_submission_preserves_atomic_write() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let db = Db::builder(
+            "/tmp/test_dropped_admitted_submission_preserves_atomic_write",
+            Arc::new(InMemory::new()),
+        )
+        .with_fp_registry(fp_registry.clone())
+        .build()
+        .await
+        .unwrap();
+        let before = db.inner.oracle.last_seq();
+        fail_parallel::cfg(fp_registry.clone(), "write-batch-post-commit", "pause").unwrap();
+        let filler_db = db.clone();
+        let filler = tokio::spawn(async move { filler_db.put(b"filler", b"value").await });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while db.inner.oracle.last_seq() <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let sequence = db.inner.oracle.last_seq() + 1;
+        let transaction = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        transaction.put(b"graph", b"committed").unwrap();
+        transaction.put(b"receipt", b"committed").unwrap();
+        let admission = transaction
+            .submit_with_options(&WriteOptions {
+                #[cfg(dst)]
+                now: 0,
+                seqnum: sequence,
+            })
+            .now_or_never();
+        // The writer cannot apply this batch while parked on the filler, but
+        // admission must already have returned an owned submission handle.
+        let admitted = matches!(&admission, Some(Ok(Some(_))));
+        let writer_owns_transaction = db.inner.txn_manager.min_active_seq().is_some();
+        drop(admission);
+        fail_parallel::cfg(fp_registry, "write-batch-post-commit", "off").unwrap();
+        filler.await.unwrap().unwrap();
+        db.flush().await.unwrap();
+        assert!(admitted, "admission must not await writer application");
+        assert!(writer_owns_transaction);
+        assert_eq!(db.inner.oracle.last_seq(), sequence);
+        assert_eq!(db.inner.txn_manager.min_active_seq(), None);
+        assert_eq!(
+            db.get(b"graph").await.unwrap(),
+            Some(Bytes::from_static(b"committed"))
+        );
+        assert_eq!(
+            db.get(b"receipt").await.unwrap(),
+            Some(Bytes::from_static(b"committed"))
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admitted_submission_reports_conflict_without_publishing_prefix() {
+        let db = Db::open(
+            "/tmp/test_admitted_submission_reports_conflict_without_publishing_prefix",
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .unwrap();
+        let first = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let second = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        first.put(b"graph", b"first").unwrap();
+        second.put(b"graph", b"second").unwrap();
+        second.put(b"receipt", b"second").unwrap();
+        first.commit().await.unwrap();
+        let sequence = db.inner.oracle.last_seq();
+        let submission = second.submit().await.unwrap().unwrap();
+        let error = submission.await_applied().await.unwrap_err();
+        assert!(matches!(error.kind(), crate::ErrorKind::Transaction));
+        assert_eq!(db.inner.oracle.last_seq(), sequence);
+        assert_eq!(
+            db.get(b"graph").await.unwrap(),
+            Some(Bytes::from_static(b"first"))
+        );
+        assert_eq!(db.get(b"receipt").await.unwrap(), None);
+        assert_eq!(db.inner.txn_manager.min_active_seq(), None);
+        assert!(db
+            .begin(IsolationLevel::Snapshot)
+            .await
+            .unwrap()
+            .submit()
+            .await
+            .unwrap()
+            .is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admitted_submission_returns_pinned_durable_handle() {
+        let store = Arc::new(InMemory::new());
+        let path = "/tmp/test_admitted_submission_returns_pinned_durable_handle";
+        let db = Db::open(path, store.clone()).await.unwrap();
+        let transaction = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        transaction.put(b"graph", b"committed").unwrap();
+        transaction.put(b"receipt", b"committed").unwrap();
+        let sequence = transaction.seqnum() + 1;
+        let submission = transaction
+            .submit_with_options(&WriteOptions {
+                #[cfg(dst)]
+                now: 0,
+                seqnum: sequence,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = submission.await_applied().await.unwrap();
+        assert_eq!(handle.seqnum(), sequence);
+        handle.await_durable().await.unwrap();
+        db.close().await.unwrap();
+        let reopened = Db::open(path, store).await.unwrap();
+        assert_eq!(
+            reopened.get(b"graph").await.unwrap(),
+            Some(Bytes::from_static(b"committed"))
+        );
+        assert_eq!(
+            reopened.get(b"receipt").await.unwrap(),
+            Some(Bytes::from_static(b"committed"))
+        );
+        reopened.close().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cancelled_commit_writer_error_cleans_up_active_txn() {
         let fp_registry = Arc::new(FailPointRegistry::new());

@@ -8,7 +8,7 @@ use crate::batch::{WriteBatch, WriteBatchIterator};
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::db::DbInner;
-use crate::db::WriteHandle;
+use crate::db::{WriteHandle, WriteSubmission};
 use crate::db_iter::{DbIterator, DbIteratorRangeTracker};
 use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
@@ -573,8 +573,39 @@ impl DbTransaction {
         self,
         options: &WriteOptions,
     ) -> Result<Option<WriteHandle>, crate::Error> {
-        // Take the write_batch for submission to the database.
-        let write_batch = self.write_batch.read().clone();
+        match self.submit_with_options(options).await? {
+            Some(submission) => submission.await_applied().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Submit a transaction with default write options, returning at admission.
+    ///
+    /// See [`Self::submit_with_options`] for cancellation and outcome semantics.
+    pub async fn submit(self) -> Result<Option<WriteSubmission>, crate::Error> {
+        self.submit_with_options(&WriteOptions::default()).await
+    }
+
+    /// Submit a transaction to the writer without waiting for application.
+    ///
+    /// Cancellation while this future is pending discards the transaction: no
+    /// write has been enqueued. A successful nonempty submission transfers the
+    /// transaction to the writer and returns a [`WriteSubmission`] in the same
+    /// poll that enqueues it, without any intervening suspension. From then on,
+    /// dropping the submission does not cancel the write. Await
+    /// [`WriteSubmission::await_applied`] to learn whether it was applied, then
+    /// [`WriteHandle::await_durable`] for object-store durability. Callers that
+    /// stop waiting after admission must resolve the outcome through their
+    /// durable request identity rather than assume the write was aborted.
+    ///
+    /// `Ok(None)` validates and finishes a read-only transaction without queueing
+    /// a write. Admission is not application: conflict and validation errors can
+    /// still be returned when awaiting a nonempty submission.
+    pub async fn submit_with_options(
+        self,
+        options: &WriteOptions,
+    ) -> Result<Option<WriteSubmission>, crate::Error> {
+        let write_batch = std::mem::take(&mut *self.write_batch.write());
 
         // Materialize the SSI read-range dependencies the transaction
         // accumulated during scans. Each tracker carries the requested scan
@@ -614,7 +645,7 @@ impl DbTransaction {
         // are handled there.
         let db_inner = Arc::clone(&self.db_inner);
         db_inner
-            .write_with_options(write_batch, options, Some(self))
+            .submit_with_options(write_batch, options, Some(self))
             .await
             .map(Some)
             .map_err(Into::into)
