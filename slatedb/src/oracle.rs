@@ -42,6 +42,7 @@ impl DbOracle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn next_seq(&self) -> u64 {
         self.last_seq.fetch_add(1, SeqCst) + 1
     }

@@ -8757,8 +8757,8 @@ mod tests {
         let seq_after_a = db.inner.oracle.last_seq();
 
         // Park the writer on a filler write: pause at post-commit and wait for
-        // the filler's processing to start (oracle.last_seq() advances at the
-        // very start of write_batch). With the writer held, txn_b's commit
+        // the filler to pass validation (oracle.last_seq() then advances).
+        // With the writer held, txn_b's commit
         // below cannot complete before we cancel it.
         fail_parallel::cfg(fp_registry.clone(), "write-batch-post-commit", "pause").unwrap();
         let filler_db = db.clone();
@@ -8801,17 +8801,7 @@ mod tests {
             .expect("failed to join filler task")
             .expect("filler write should succeed");
 
-        // The writer picks up txn_b's batch (last_seq advances at the start of
-        // write_batch, before conflict detection rejects it)...
-        let processed = tokio::time::timeout(Duration::from_secs(30), async {
-            while db.inner.oracle.last_seq() <= seq_after_filler {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        assert!(processed.is_ok(), "writer did not start processing txn_b");
-
-        // ...and cleans it up from active_txns.
+        // Cleanup, not sequence consumption, proves the rejected message was processed.
         let cleaned = tokio::time::timeout(Duration::from_secs(30), async {
             while db.inner.txn_manager.min_active_seq().is_some() {
                 tokio::task::yield_now().await;
@@ -8822,6 +8812,7 @@ mod tests {
             cleaned.is_ok(),
             "txn_b should have been cleaned up from active_txns by the writer"
         );
+        assert_eq!(db.inner.oracle.last_seq(), seq_after_filler);
 
         // txn_b was rejected, so its write must not be visible.
         assert_eq!(
@@ -8877,7 +8868,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_txn_conflict_commit_seq_gap_does_not_block_l0_retirement() {
+    async fn test_explicit_commit_seq_gap_after_conflict_does_not_block_l0_retirement() {
         const REPRO_SEED: u64 = 2_985_011_763_506_195_159;
         const MAX_UNFLUSHED_BYTES: usize = 8 * 1024;
         const LARGE_VALUE_BYTES: usize = 16 * 1024;
@@ -8903,7 +8894,7 @@ mod tests {
         };
 
         // Establish and flush seq=1 so the L0 manifest writer has a known
-        // contiguous frontier before the conflict sequence gap is created.
+        // contiguous frontier before the explicit sequence gap is created.
         db.put_with_options(b"conflict-key", b"v1", &PutOptions::default(), &write_opts)
             .await
             .unwrap();
@@ -8944,29 +8935,35 @@ mod tests {
         .expect("timed out flushing conflict-producing write")
         .expect("conflict-producing write flush should succeed");
 
-        // The transaction commit must fail, but the bug is that write_batch
-        // allocates commit_seq=3 before conflict detection and never writes it
-        // into a memtable. This leaves a durable-memtable sequence hole.
         txn.put(b"txn-write", b"will-conflict").unwrap();
         let err = txn.commit().await.expect_err("transaction should conflict");
         assert_eq!(err.kind(), crate::ErrorKind::Transaction);
+        assert_eq!(
+            db.inner.oracle.last_seq(),
+            2,
+            "conflicts must not reserve seq=3"
+        );
 
-        // Write enough data to freeze an immutable memtable. Its first sequence
-        // is 4 because seq=3 was consumed by the failed transaction commit.
+        // Explicitly skip seq=3 to retain L0 gap-recovery coverage even though
+        // conflicts no longer consume a sequence.
         let large_value = vec![b'x'; LARGE_VALUE_BYTES];
         let large_handle = db
             .put_with_options(
                 b"large-after-conflict",
                 &large_value,
                 &PutOptions::default(),
-                &write_opts,
+                &WriteOptions {
+                    #[cfg(dst)]
+                    now: 0,
+                    seqnum: 4,
+                },
             )
             .await
             .expect("large write after conflict should be accepted");
         assert_eq!(
             large_handle.seqnum(),
             4,
-            "the conflicted commit should have consumed commit_seq=3"
+            "the explicit write must leave a gap at seq=3"
         );
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -9000,10 +8997,7 @@ mod tests {
         .await
         .expect("large write never froze or flushed");
 
-        // This write enters backpressure because the stuck immutable memtable
-        // remains charged against max_unflushed_bytes. The expected failure is
-        // this timeout, which proves the hang without letting the test run
-        // forever.
+        // Gap recovery must release backpressure from the immutable memtable.
         tokio::time::timeout(
             Duration::from_secs(5),
             db.put_with_options(
@@ -9014,8 +9008,8 @@ mod tests {
             ),
         )
         .await
-        .expect("timed out waiting for write after conflicted transaction consumed commit_seq=3")
-        .expect("write after conflicted commit sequence gap should succeed");
+        .expect("timed out waiting for write after explicit sequence gap")
+        .expect("write after explicit commit sequence gap should succeed");
 
         db.close().await.unwrap();
     }

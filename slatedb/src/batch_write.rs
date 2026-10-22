@@ -202,21 +202,24 @@ impl DbInner {
         #[cfg(dst)]
         // Force the current timestamp for DST operations. See #719 for details.
         let now = options.now;
-        // If the user supplied a sequence number, validate that it's strictly greater
-        // than the current max and advance the oracle. No CAS loop is needed here because
-        // write_batch is always called from a single-writer event loop.
+        // Plan the sequence without reserving it. A conflict or invalid batch must
+        // leave it available for a later write pinned to this sequence.
+        let current_seq = self.oracle.last_seq();
         let commit_seq = if options.seqnum > 0 {
-            let current = self.oracle.last_seq();
-            if options.seqnum <= current {
+            if options.seqnum <= current_seq {
                 return Ok(Err(SlateDBError::InvalidSequenceNumber {
                     provided: options.seqnum,
-                    current,
+                    current: current_seq,
                 }));
             }
-            self.oracle.advance_last_seq(options.seqnum);
             options.seqnum
         } else {
-            self.oracle.next_seq()
+            current_seq
+                .checked_add(1)
+                .ok_or(SlateDBError::InvalidSequenceNumber {
+                    provided: 0,
+                    current: current_seq,
+                })?
         };
 
         // Check for transaction conflicts before proceeding with the write batch
@@ -251,6 +254,10 @@ impl DbInner {
         if let Err(error) = self.validate_segment_antichain(&touched_segments) {
             return Ok(Err(error));
         }
+
+        // The batch writer serializes writes. Reserve only after every validation
+        // that can reject a write without publishing it to the WAL has passed.
+        self.oracle.advance_last_seq(commit_seq);
 
         if let Some(wal_writer) = wal_writer.as_mut() {
             assert!(self.wal_enabled);
@@ -514,6 +521,7 @@ mod tests {
     use crate::wal::test_utils::FakeWalWriter;
     use crate::wal::{WalError, WalObserver, WalStatus};
     use crate::Db;
+    use crate::IsolationLevel;
 
     enum FailingWalOperation {
         Append,
@@ -668,6 +676,48 @@ mod tests {
         handler.handle(msg).await.unwrap();
         let write_handle = done_rx.await.unwrap().unwrap();
         assert!(write_handle.seqnum() > 42);
+    }
+
+    #[tokio::test]
+    async fn test_rejected_transaction_does_not_strand_pinned_sequence() {
+        let db = Db::open(
+            "/tmp/test_rejected_transaction_does_not_strand_pinned_sequence",
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .unwrap();
+        let first = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let rejected = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        first.put(b"conflict", b"first").unwrap();
+        rejected.put(b"conflict", b"rejected").unwrap();
+        first.commit().await.unwrap();
+        let committed = db.inner.oracle.last_seq();
+
+        assert!(rejected.commit().await.is_err());
+        assert_eq!(
+            db.inner.oracle.last_seq(),
+            committed,
+            "a write rejected before WAL append must not reserve a sequence"
+        );
+
+        let fresh = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(fresh.seqnum(), committed);
+        fresh.put(b"later", b"committed").unwrap();
+        let handle = fresh
+            .commit_with_options(&WriteOptions {
+                #[cfg(dst)]
+                now: 0,
+                seqnum: committed + 1,
+            })
+            .await
+            .unwrap()
+            .expect("nonempty pinned transaction");
+        assert_eq!(handle.seqnum(), committed + 1);
+        assert_eq!(
+            db.get(b"conflict").await.unwrap(),
+            Some(Bytes::from_static(b"first"))
+        );
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
