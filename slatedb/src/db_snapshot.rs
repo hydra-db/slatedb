@@ -853,9 +853,7 @@ mod tests {
             let stop = Arc::clone(&stop);
             tokio::spawn(async move {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let delete_txn = db
-                        .begin(IsolationLevel::SerializableSnapshot)
-                        .unwrap();
+                    let delete_txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
                     let delete_sequence = delete_txn.seqnum() + 1;
                     delete_txn.delete(b"key").unwrap();
                     delete_txn
@@ -880,9 +878,7 @@ mod tests {
                         .expect("delete transaction must contain a write");
                     deleted.await_durable().await.unwrap();
                     history.lock().unwrap().insert(deleted.seqnum(), None);
-                    let insert_txn = db
-                        .begin(IsolationLevel::SerializableSnapshot)
-                        .unwrap();
+                    let insert_txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
                     let insert_sequence = insert_txn.seqnum() + 1;
                     insert_txn.put(b"key", b"present").unwrap();
                     insert_txn
