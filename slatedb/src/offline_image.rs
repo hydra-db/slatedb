@@ -14,6 +14,7 @@ use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::DbRand;
 
 use crate::block_cache_policy::BlockCachePolicy;
+use crate::config::CompressionCodec;
 use crate::db_state::{SortedRun, SsTableId, SsTableView};
 use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
@@ -33,12 +34,21 @@ pub struct OfflineImageOptions {
     /// The writer closes an SST after a completed block takes it past this
     /// threshold, so the physical object may be slightly larger.
     pub target_sst_size_bytes: usize,
+
+    /// Block compression for the output SSTs.
+    ///
+    /// Each SST records its codec, so readers decode the image whatever codec
+    /// the database that later opens it is configured with. Set it to the
+    /// writer's [`Settings::compression_codec`](crate::config::Settings) so the
+    /// image matches the SSTs that compaction writes later.
+    pub compression_codec: Option<CompressionCodec>,
 }
 
 impl Default for OfflineImageOptions {
     fn default() -> Self {
         Self {
             target_sst_size_bytes: 1024 * 1024 * 1024,
+            compression_codec: None,
         }
     }
 }
@@ -97,7 +107,10 @@ impl OfflineImageBuilder {
 
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(object_store, None),
-            SsTableFormat::default(),
+            SsTableFormat {
+                compression_codec: options.compression_codec,
+                ..SsTableFormat::default()
+            },
             PathResolver::from_root(path),
             Arc::new(FailPointRegistry::new()),
             None,
@@ -230,6 +243,7 @@ mod tests {
             store.clone(),
             OfflineImageOptions {
                 target_sst_size_bytes: 1,
+                ..OfflineImageOptions::default()
             },
         )
         .await
@@ -251,6 +265,61 @@ mod tests {
         assert_eq!(
             db.get(b"key-0042").await.unwrap(),
             Some(Bytes::from(format!("value-42-{}", "x".repeat(64))))
+        );
+        db.close().await.unwrap();
+    }
+
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn compresses_blocks_and_reads_them_back() {
+        use futures::TryStreamExt;
+
+        async fn build(
+            codec: Option<crate::config::CompressionCodec>,
+        ) -> (Arc<dyn ObjectStore>, u64) {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut builder = OfflineImageBuilder::create(
+                Path::from("offline"),
+                store.clone(),
+                OfflineImageOptions {
+                    compression_codec: codec,
+                    ..OfflineImageOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for index in 0..10_000u32 {
+                builder
+                    .add(
+                        Bytes::from(format!("cell/c/vprop_idx/name/s:value-{index:08}")),
+                        Bytes::from_static(b"1"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            builder.finish().await.unwrap();
+            let bytes = store
+                .list(Some(&Path::from("offline/compacted")))
+                .map_ok(|meta| meta.size)
+                .try_fold(0, |total, size| async move { Ok(total + size) })
+                .await
+                .unwrap();
+            (store, bytes)
+        }
+
+        let (_, plain) = build(None).await;
+        let (store, compressed) = build(Some(crate::config::CompressionCodec::Zstd)).await;
+        assert!(
+            compressed * 2 < plain,
+            "zstd image is {compressed} bytes, uncompressed {plain}"
+        );
+
+        let db = Db::open(Path::from("offline"), store).await.unwrap();
+        assert_eq!(
+            db.get(b"cell/c/vprop_idx/name/s:value-00004242")
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"1"))
         );
         db.close().await.unwrap();
     }
