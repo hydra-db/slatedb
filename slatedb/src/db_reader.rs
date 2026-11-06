@@ -93,6 +93,10 @@ enum WalReplayEnd {
     /// Ask the configured WAL reader for the newest WAL file and replay through it,
     /// picking up writes made after the manifest was written.
     Latest,
+
+    /// Replay through this WAL file id, which the caller learned out of band
+    /// (from the writer that flushed it), without asking the WAL reader.
+    Through(u64),
 }
 
 impl WalReplayEnd {
@@ -461,6 +465,12 @@ impl DbReaderInner {
     }
 
     async fn maybe_replay_new_wals(&self) -> Result<(), SlateDBError> {
+        self.replay_new_wals(WalReplayEnd::Latest).await
+    }
+
+    /// Replay WAL files past this reader's state, through `end`. The caller
+    /// must hold `refresh_gate`.
+    async fn replay_new_wals(&self, end: WalReplayEnd) -> Result<(), SlateDBError> {
         if self.options.skip_wal_replay {
             return Ok(());
         }
@@ -472,7 +482,7 @@ impl DbReaderInner {
             &self.options,
             current_state.core(),
             &mut imm_memtable,
-            WalReplayEnd::Latest,
+            end,
             self.segment_extractor.as_ref(),
         )
         .await?;
@@ -729,6 +739,17 @@ impl DbReaderInner {
         self.refresh_locked().await
     }
 
+    async fn replay_wal_through(&self, through_wal_id: u64) -> Result<(), SlateDBError> {
+        let _refresh_guard = self.refresh_gate.lock().await;
+        match self.mode {
+            DbReaderMode::Checkpoint(_) => Ok(()),
+            DbReaderMode::ManagedCheckpoint | DbReaderMode::FollowLatest => {
+                self.replay_new_wals(WalReplayEnd::Through(through_wal_id))
+                    .await
+            }
+        }
+    }
+
     async fn maintain_retired_checkpoints(
         &self,
         manifest: &mut StoredManifest,
@@ -845,6 +866,9 @@ impl DbReaderInner {
             WalReplayEnd::Latest => wal_reader
                 .last_wal_file_id(replay_after_wal_id)
                 .await?
+                .checked_add(1)
+                .ok_or(SlateDBError::InvalidDBState)?,
+            WalReplayEnd::Through(through_wal_id) => through_wal_id
                 .checked_add(1)
                 .ok_or(SlateDBError::InvalidDBState)?,
         };
@@ -1836,6 +1860,27 @@ impl DbReader {
         self.inner.refresh().await.map_err(Into::into)
     }
 
+    /// Replays durable WAL files through `through_wal_id`, without reading the
+    /// manifest or asking the WAL reader where the WAL ends.
+    ///
+    /// For a caller that learns the writer's last flushed WAL file id out of
+    /// band, such as from the writer itself: [`Self::refresh`] spends a
+    /// manifest read and a search for the newest WAL file to find what this
+    /// already says. Pass only an id the writer has durably flushed.
+    ///
+    /// Files this reader has already replayed are skipped, so a stale or
+    /// repeated id is a no-op. It does not move the reader to a newer manifest:
+    /// call [`Self::refresh`] for that, and after an error, since the files may
+    /// have been garbage collected once a newer manifest covered them. A reader
+    /// pinned to a user checkpoint remains unchanged.
+    pub async fn replay_wal_through(&self, through_wal_id: u64) -> Result<(), crate::Error> {
+        self.inner.check_closed()?;
+        self.inner
+            .replay_wal_through(through_wal_id)
+            .await
+            .map_err(Into::into)
+    }
+
     /// See [`DbMetadataOps::manifest`].
     pub fn manifest(&self) -> VersionedManifest {
         <Self as DbMetadataOps>::manifest(self)
@@ -2029,6 +2074,97 @@ mod tests {
         assert!(wal_reader.last_wal_file_id_calls.load(Ordering::Relaxed) > 0);
         assert!(wal_reader.iterator_calls.load(Ordering::Relaxed) > 0);
         reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_wal_through_reads_the_given_files_without_asking_where_the_wal_ends() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_replay_wal_through_skips_discovery");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let wal_reader = Arc::new(CountingWalReader::default());
+        let reader = DbReader::builder(path, object_store)
+            .with_reader_mode(DbReaderMode::ManagedCheckpoint)
+            .with_wal_reader(wal_reader.clone())
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60),
+                ..DbReaderOptions::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let discovery = wal_reader.last_wal_file_id_calls.load(Ordering::Relaxed);
+        let iterators = wal_reader.iterator_calls.load(Ordering::Relaxed);
+        let replayed = reader.inner.state.read().last_wal_id;
+
+        reader.replay_wal_through(replayed + 5).await.unwrap();
+        assert_eq!(
+            wal_reader.last_wal_file_id_calls.load(Ordering::Relaxed),
+            discovery,
+            "the caller named the end, so nothing searches for it"
+        );
+        assert_eq!(
+            wal_reader.iterator_calls.load(Ordering::Relaxed),
+            iterators + 1
+        );
+
+        reader.replay_wal_through(replayed).await.unwrap();
+        assert_eq!(
+            wal_reader.iterator_calls.load(Ordering::Relaxed),
+            iterators + 1,
+            "files already replayed are not read again"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_wal_through_the_writers_flushed_wal_makes_its_writes_visible() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_replay_wal_through_visibility");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"value")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_secs(60),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let manifest_id = reader.manifest().id();
+        let handle = db.put(b"after", b"value").await.unwrap();
+        let seq = handle.seqnum();
+        handle.await_durable().await.unwrap();
+        assert_eq!(reader.get(b"after").await.unwrap(), None);
+
+        reader
+            .replay_wal_through(db.last_flushed_wal_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"after").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        assert!(reader.status().durable_seq >= seq);
+        assert_eq!(
+            reader.manifest().id(),
+            manifest_id,
+            "WAL replay alone leaves the manifest where it was"
+        );
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
