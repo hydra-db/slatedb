@@ -896,7 +896,15 @@ impl DbReaderInner {
         while let Some(replayed_table) = match replay_iter.next().await {
             Ok(Some(replayed_table)) => Some(replayed_table),
             Ok(None) => None,
-            Err(SlateDBError::WalTruncated(_)) => None,
+            // Discovering the end (`Latest`), a missing file is where the WAL
+            // stops. Through a caller-named file, the writer flushed every file
+            // in range, so a missing one was garbage collected: report it, so
+            // the caller refreshes instead of reading short.
+            Err(SlateDBError::WalTruncated(_))
+                if !matches!(replay_end, WalReplayEnd::Through(_)) =>
+            {
+                None
+            }
             Err(err) => return Err(err),
         } {
             // `last_wal_id` is a conservative watermark: a table that ends mid-file
@@ -2163,6 +2171,74 @@ mod tests {
             reader.manifest().id(),
             manifest_id,
             "WAL replay alone leaves the manifest where it was"
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_wal_through_reports_a_collected_file_instead_of_stopping_short() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_replay_wal_through_collected");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"seed", b"value")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_secs(60),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let replayed = reader.inner.state.read().last_wal_id;
+        for key in [b"first", b"later"] {
+            db.put(key, b"value")
+                .await
+                .unwrap()
+                .await_durable()
+                .await
+                .unwrap();
+        }
+        let through = db.last_flushed_wal_id();
+        assert!(
+            through > replayed + 1,
+            "the writes span more than one WAL file"
+        );
+
+        // Collect the first file the reader still needs, as GC would once a
+        // newer manifest covered it.
+        use futures::TryStreamExt as _;
+        let wal_name = format!("{:020}.sst", replayed + 1);
+        let collected = object_store
+            .list(Some(&path))
+            .map_ok(|meta| meta.location)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|location| {
+                location.as_ref().contains("/wal/") && location.as_ref().ends_with(&wal_name)
+            })
+            .expect("the first WAL file the reader needs exists");
+        object_store.delete(&collected).await.unwrap();
+
+        let error = reader.replay_wal_through(through).await.unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("trunc"),
+            "a gap inside the named range is an error, got {error}"
+        );
+        assert_eq!(
+            reader.get(b"later").await.unwrap(),
+            None,
+            "nothing past the gap was applied"
         );
         db.close().await.unwrap();
     }
