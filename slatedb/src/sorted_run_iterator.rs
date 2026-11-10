@@ -1324,3 +1324,232 @@ mod tests {
         }
     }
 }
+
+// Descending-scan regression cases carried from the HydraDB fork. Upstream #2067 fixed descending
+// sorted-run scans, so the fork's own fix was dropped. These cases guard the shapes that broke there.
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+    use crate::block_cache_policy::BlockCachePolicy;
+    use crate::db_state::SsTableId;
+    use crate::format::sst::SsTableFormat;
+    use crate::tablestore::TableStoreKind;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use std::ops::Bound;
+    use std::sync::Arc;
+
+    fn direction_store() -> Arc<TableStore> {
+        Arc::new(TableStore::new(
+            Arc::new(InMemory::new()),
+            SsTableFormat {
+                block_size: 64,
+                ..SsTableFormat::default()
+            },
+            Path::from("direction-fixture"),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ))
+    }
+
+    async fn write_view(store: &Arc<TableStore>, rows: &[(&str, u64)]) -> SsTableView {
+        let mut builder = store.table_builder();
+        for (key, seq) in rows {
+            builder
+                .add(RowEntry::new_value(
+                    key.as_bytes(),
+                    format!("value{seq}").as_bytes(),
+                    *seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let handle = store
+            .write_sst(
+                &SsTableId::new(ulid::Ulid::new()),
+                &encoded,
+                Some(Bytes::new()),
+            )
+            .await
+            .unwrap();
+        SsTableView::identity(handle)
+    }
+
+    // Three SSTs with gaps, multiple blocks and two versions per key.
+    async fn direction_fixture() -> (Arc<TableStore>, SortedRun) {
+        let store = direction_store();
+        let mut views = Vec::new();
+        for start in [1, 7, 13] {
+            let keys = (start..start + 4)
+                .map(|n| format!("key{n:02}"))
+                .collect::<Vec<_>>();
+            let rows = keys
+                .iter()
+                .flat_map(|k| [(k.as_str(), 2), (k.as_str(), 1)])
+                .collect::<Vec<_>>();
+            views.push(write_view(&store, &rows).await);
+        }
+        (store, SortedRun::new(0, views))
+    }
+
+    async fn direction_iter<'a>(
+        range: &'a BytesRange,
+        run: &'a SortedRun,
+        store: Arc<TableStore>,
+        order: IterationOrder,
+        owned: bool,
+    ) -> SortedRunIterator<'a> {
+        let options = SstIteratorOptions {
+            order,
+            ..SstIteratorOptions::default()
+        };
+        if owned {
+            SortedRunIterator::new_owned_initialized(range.clone(), run.clone(), store, options)
+                .await
+                .unwrap()
+        } else {
+            let bounds = (
+                range.start_bound().map(|k| k.as_ref()),
+                range.end_bound().map(|k| k.as_ref()),
+            );
+            SortedRunIterator::new_borrowed_initialized(bounds, run, store, options)
+                .await
+                .unwrap()
+        }
+    }
+
+    fn direction_expected(range: &BytesRange, order: IterationOrder) -> Vec<(Bytes, u64)> {
+        let mut keys = [1, 2, 3, 4, 7, 8, 9, 10, 13, 14, 15, 16]
+            .map(|n| Bytes::from(format!("key{n:02}")))
+            .to_vec();
+        if matches!(order, IterationOrder::Descending) {
+            keys.reverse();
+        }
+        keys.into_iter()
+            .filter(|k| range.contains(k))
+            .flat_map(|k| [(k.clone(), 2), (k, 1)])
+            .collect()
+    }
+
+    async fn direction_drain(iter: &mut SortedRunIterator<'_>) -> Vec<(Bytes, u64)> {
+        let mut rows = Vec::new();
+        while let Some(row) = iter.next().await.unwrap() {
+            rows.push((row.key, row.seq));
+        }
+        assert!(iter.next().await.unwrap().is_none());
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_direction_ranges_and_versions() {
+        let (store, run) = direction_fixture().await;
+        let ranges = [
+            BytesRange::from(..),
+            BytesRange::from_ref("key04"..="key13"),
+            BytesRange::from_ref("key04".."key13"),
+            BytesRange::new(
+                Bound::Excluded(Bytes::from("key04")),
+                Bound::Excluded(Bytes::from("key13")),
+            ),
+            BytesRange::from_ref("key07"..="key07"),
+            BytesRange::from_ref("key05"..="key06"),
+            BytesRange::from_ref("key00"..="key00"),
+            BytesRange::from_ref("key18"..),
+        ];
+        for range in &ranges {
+            for order in [IterationOrder::Ascending, IterationOrder::Descending] {
+                for owned in [true, false] {
+                    let mut iter = direction_iter(range, &run, store.clone(), order, owned).await;
+                    assert_eq!(
+                        direction_drain(&mut iter).await,
+                        direction_expected(range, order),
+                        "range={range:?}, order={order:?}, owned={owned}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_projected_ranges() {
+        let (store, run) = direction_fixture().await;
+        let views = run
+            .sst_views()
+            .iter()
+            .zip([("key02", "key04"), ("key08", "key10"), ("key14", "key16")])
+            .map(|(view, (lo, hi))| {
+                SsTableView::new_projected(
+                    ulid::Ulid::new(),
+                    view.sst.clone(),
+                    Some(BytesRange::from_ref(lo..hi)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected = SortedRun::new(0, views);
+        let range = BytesRange::from_ref("key03"..="key14");
+        let expected = ["key14", "key09", "key08", "key03"]
+            .into_iter()
+            .flat_map(|k| [(Bytes::from(k), 2), (Bytes::from(k), 1)])
+            .collect::<Vec<_>>();
+        for owned in [true, false] {
+            let mut iter = direction_iter(
+                &range,
+                &projected,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(direction_drain(&mut iter).await, expected, "owned={owned}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_run_descending_versions_at_shared_sst_boundary() {
+        let store = direction_store();
+        let mut views = Vec::new();
+        for rows in [
+            vec![("a", 1), ("b", 5), ("b", 4)],
+            vec![("b", 3), ("b", 2)],
+            vec![("b", 1), ("c", 1)],
+        ] {
+            views.push(write_view(&store, &rows).await);
+        }
+        let run = SortedRun::new(0, views);
+        let all = [
+            ("c", 1),
+            ("b", 5),
+            ("b", 4),
+            ("b", 3),
+            ("b", 2),
+            ("b", 1),
+            ("a", 1),
+        ]
+        .map(|(k, seq)| (Bytes::from(k), seq))
+        .to_vec();
+        for owned in [true, false] {
+            let range = BytesRange::from(..);
+            let mut iter = direction_iter(
+                &range,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(direction_drain(&mut iter).await, all, "owned={owned}");
+            let point = BytesRange::from_ref("b"..="b");
+            let mut iter = direction_iter(
+                &point,
+                &run,
+                store.clone(),
+                IterationOrder::Descending,
+                owned,
+            )
+            .await;
+            assert_eq!(direction_drain(&mut iter).await, all[1..6], "owned={owned}");
+        }
+    }
+}
