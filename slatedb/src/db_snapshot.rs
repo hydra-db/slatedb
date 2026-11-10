@@ -835,8 +835,9 @@ mod tests {
         )?;
         let first = first_txn
             .commit_with_options(&WriteOptions {
+                #[cfg(dst)]
+                now: 0,
                 seqnum: first_sequence,
-                ..WriteOptions::default()
             })
             .await?
             .expect("initial transaction must contain a write");
@@ -870,8 +871,9 @@ mod tests {
                         .unwrap();
                     let deleted = delete_txn
                         .commit_with_options(&WriteOptions {
+                            #[cfg(dst)]
+                            now: 0,
                             seqnum: delete_sequence,
-                            ..WriteOptions::default()
                         })
                         .await
                         .unwrap()
@@ -895,8 +897,9 @@ mod tests {
                         .unwrap();
                     let inserted = insert_txn
                         .commit_with_options(&WriteOptions {
+                            #[cfg(dst)]
+                            now: 0,
                             seqnum: insert_sequence,
-                            ..WriteOptions::default()
                         })
                         .await
                         .unwrap()

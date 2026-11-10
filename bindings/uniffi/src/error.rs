@@ -240,7 +240,7 @@ mod tests {
     async fn missing_database_preserves_binding_data_error() {
         let error = match slatedb::DbReader::open(
             "missing-binding-database",
-            Arc::new(slatedb::object_store::memory::InMemory::new()),
+            Arc::new(object_store::memory::InMemory::new()),
             slatedb::DbReaderMode::ManagedCheckpoint,
             slatedb::config::DbReaderOptions::default(),
         )
