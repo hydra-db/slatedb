@@ -728,7 +728,10 @@ impl MessageHandler<WorkerMessage> for CompactionWorkerHandler {
 
     async fn handle(&mut self, message: WorkerMessage) -> Result<(), SlateDBError> {
         if !self.ensure_loaded().await? {
-            warn!(
+            // A writer starts its embedded worker before the compactor creates `.compactions`,
+            // so the first polls of every new writer land here. The worker has nothing to
+            // claim yet and touches no data.
+            debug!(
                 ".compactions does not exist yet; retrying on the next poll [worker_id={}]",
                 self.worker_id
             );
