@@ -5,6 +5,7 @@
 //! manifest after every SST has been durably uploaded. It is intended for bulk
 //! importers that already own ordering, deduplication, and validation.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -104,6 +105,45 @@ pub struct OfflineImageBuilder {
     last_key: Option<Bytes>,
     ssts: Vec<SsTableView>,
     entries: u64,
+    first_key: Option<Bytes>,
+    pending_parts: Arc<AtomicUsize>,
+}
+
+/// Build one contiguous key range without publishing a database manifest.
+///
+/// Callers bound the number and memory of concurrent parts. Return every completed
+/// part to its parent in key order. A lost or failed part prevents publication.
+pub struct OfflineImagePartBuilder {
+    inner: OfflineImageBuilder,
+    owner: Arc<AtomicUsize>,
+}
+
+/// Completed SSTs that only their original parent can publish.
+pub struct OfflineImagePart {
+    owner: Arc<AtomicUsize>,
+    first_key: Option<Bytes>,
+    last_key: Option<Bytes>,
+    ssts: Vec<SsTableView>,
+    entries: u64,
+}
+
+impl OfflineImagePartBuilder {
+    /// Add a pair in strictly increasing key order within this part.
+    pub async fn add(&mut self, key: Bytes, value: Bytes) -> Result<(), Error> {
+        self.inner.add(key, value).await
+    }
+
+    /// Finish durable SST uploads without creating a manifest.
+    pub async fn finish(mut self) -> Result<OfflineImagePart, Error> {
+        self.inner.close_current_sst().await?;
+        Ok(OfflineImagePart {
+            owner: self.owner,
+            first_key: self.inner.first_key,
+            last_key: self.inner.last_key,
+            ssts: self.inner.ssts,
+            entries: self.inner.entries,
+        })
+    }
 }
 
 impl OfflineImageBuilder {
@@ -157,7 +197,68 @@ impl OfflineImageBuilder {
             last_key: None,
             ssts: Vec::new(),
             entries: 0,
+            first_key: None,
+            pending_parts: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Create an independent SST writer for a contiguous key range.
+    ///
+    /// Each part must finish and be accepted before the parent can publish.
+    /// Dropping a part does not cancel this requirement.
+    pub fn part_builder(&self) -> OfflineImagePartBuilder {
+        self.pending_parts.fetch_add(1, Ordering::Relaxed);
+        OfflineImagePartBuilder {
+            owner: self.pending_parts.clone(),
+            inner: Self {
+                manifest_store: self.manifest_store.clone(),
+                table_store: self.table_store.clone(),
+                clock: self.clock.clone(),
+                rand: self.rand.clone(),
+                target_sst_size_bytes: self.target_sst_size_bytes,
+                current_writer: None,
+                current_sst_bytes: 0,
+                last_key: None,
+                ssts: Vec::new(),
+                entries: 0,
+                first_key: None,
+                pending_parts: Arc::new(AtomicUsize::new(0)),
+            },
+        }
+    }
+
+    /// Accept a finished part after all previously accepted keys.
+    ///
+    /// Foreign, overlapping and out-of-order parts fail. The parent remains
+    /// unable to publish after rejecting one of its outstanding parts.
+    pub async fn add_part(&mut self, part: OfflineImagePart) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.pending_parts, &part.owner) {
+            return Err(Error::invalid(
+                "offline image part belongs to another builder".to_string(),
+            ));
+        }
+        if let (Some(last), Some(first)) = (&self.last_key, &part.first_key) {
+            if last >= first {
+                return Err(Error::invalid(
+                    "offline image parts overlap or are out of order".to_string(),
+                ));
+            }
+        }
+        let entries = self
+            .entries
+            .checked_add(part.entries)
+            .ok_or_else(|| Error::invalid("offline image entry count overflow".to_string()))?;
+        self.close_current_sst().await?;
+        if self.first_key.is_none() {
+            self.first_key = part.first_key;
+        }
+        if part.last_key.is_some() {
+            self.last_key = part.last_key;
+        }
+        self.ssts.extend(part.ssts);
+        self.entries = entries;
+        self.pending_parts.fetch_sub(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Add one key/value pair to the image.
@@ -196,6 +297,9 @@ impl OfflineImageBuilder {
         {
             self.current_sst_bytes += block_size;
         }
+        if self.first_key.is_none() {
+            self.first_key = Some(key.clone());
+        }
         self.last_key = Some(key);
         self.entries += 1;
 
@@ -207,6 +311,11 @@ impl OfflineImageBuilder {
 
     /// Publish the completed image and return its summary.
     pub async fn finish(mut self) -> Result<OfflineImageResult, Error> {
+        if self.pending_parts.load(Ordering::Relaxed) != 0 {
+            return Err(Error::invalid(
+                "offline image has unfinished or unaccepted parts".to_string(),
+            ));
+        }
         self.close_current_sst().await?;
 
         let mut core = ManifestCore::new();
@@ -275,6 +384,114 @@ mod tests {
     use crate::read_trace::ReadTrace;
     use crate::tablestore::TableStore;
     use crate::{Db, ErrorKind};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_parts_publish_one_ordered_database() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("parallel-parts");
+        let mut parent = OfflineImageBuilder::create(
+            path.clone(),
+            store.clone(),
+            OfflineImageOptions {
+                target_sst_size_bytes: 128,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let tasks = (0..4)
+            .map(|part| {
+                let mut writer = parent.part_builder();
+                tokio::spawn(async move {
+                    for index in part * 100..(part + 1) * 100 {
+                        writer
+                            .add(
+                                Bytes::from(format!("key-{index:04}")),
+                                Bytes::from(format!("value-{index}")),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    writer.finish().await.unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            parent.add_part(task.await.unwrap()).await.unwrap();
+        }
+        let result = parent.finish().await.unwrap();
+        assert_eq!(result.entries, 400);
+        assert!(result.ssts >= 4);
+        let db = Db::open(path, store).await.unwrap();
+        for index in 0..400 {
+            assert_eq!(
+                db.get(format!("key-{index:04}").as_bytes()).await.unwrap(),
+                Some(Bytes::from(format!("value-{index}")))
+            );
+        }
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_parts_and_overlapping_parts_cannot_publish() {
+        use futures::TryStreamExt;
+        for missing in [true, false] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut parent =
+                OfflineImageBuilder::create("parts", store.clone(), OfflineImageOptions::default())
+                    .await
+                    .unwrap();
+            let mut first = parent.part_builder();
+            let mut second = parent.part_builder();
+            first
+                .add(Bytes::from_static(b"b"), Bytes::from_static(b"1"))
+                .await
+                .unwrap();
+            parent
+                .add_part(first.finish().await.unwrap())
+                .await
+                .unwrap();
+            if missing {
+                // A dropped writer must remain an outstanding publication obligation.
+                drop(second);
+            } else {
+                second
+                    .add(Bytes::from_static(b"b"), Bytes::from_static(b"2"))
+                    .await
+                    .unwrap();
+                assert!(parent
+                    .add_part(second.finish().await.unwrap())
+                    .await
+                    .is_err());
+            }
+            assert!(parent.finish().await.is_err());
+            let objects = store.list(None).try_collect::<Vec<_>>().await.unwrap();
+            assert!(objects
+                .iter()
+                .all(|o| !o.location.as_ref().contains("/manifest/")));
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_parts_fail_and_empty_parts_work() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first =
+            OfflineImageBuilder::create("first", store.clone(), OfflineImageOptions::default())
+                .await
+                .unwrap();
+        let mut second =
+            OfflineImageBuilder::create("second", store, OfflineImageOptions::default())
+                .await
+                .unwrap();
+        assert!(second
+            .add_part(first.part_builder().finish().await.unwrap())
+            .await
+            .is_err());
+        assert!(first.finish().await.is_err());
+        let empty = second.part_builder().finish().await.unwrap();
+        second.add_part(empty).await.unwrap();
+        assert_eq!(second.finish().await.unwrap().entries, 0);
+    }
 
     #[tokio::test]
     async fn publishes_a_readable_multi_sst_database() {
@@ -446,6 +663,28 @@ mod tests {
         }
         builder.finish().await.unwrap();
 
+        // Parts use the same filter policies as the parent builder.
+        let mut parts = OfflineImageBuilder::create(
+            Path::from("parts"),
+            store.clone(),
+            OfflineImageOptions {
+                filter_policies: policies.clone(),
+                ..OfflineImageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        for keys in keys.chunks(2_000) {
+            let mut part = parts.part_builder();
+            for key in keys {
+                part.add(key.clone(), Bytes::from_static(b"v"))
+                    .await
+                    .unwrap();
+            }
+            parts.add_part(part.finish().await.unwrap()).await.unwrap();
+        }
+        parts.finish().await.unwrap();
+
         let settings = Settings {
             flush_interval: Some(Duration::from_millis(100)),
             manifest_poll_interval: Duration::from_millis(100),
@@ -498,7 +737,9 @@ mod tests {
         db.close().await.unwrap();
 
         let image = compacted_filter_names(store.clone(), "image", policies.clone()).await;
+        let parts = compacted_filter_names(store.clone(), "parts", policies.clone()).await;
         let compacted = compacted_filter_names(store, "loaded", policies).await;
+        assert_eq!(parts, vec![image[0].clone(), image[0].clone()]);
         assert_eq!(
             image,
             vec![vec!["_bf".to_string(), "_bf:p=fixed3".to_string()]]

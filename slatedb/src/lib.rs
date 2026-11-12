@@ -68,7 +68,10 @@ pub use iter::IterationOrder;
 pub use manifest::VersionedManifest;
 pub use merge_operator::{MergeOperator, MergeOperatorError};
 pub use mirror_policy::{SlateDbMirrorPolicy, SlateDbMirrorPolicyBuilder};
-pub use offline_image::{OfflineImageBuilder, OfflineImageOptions, OfflineImageResult};
+pub use offline_image::{
+    OfflineImageBuilder, OfflineImageOptions, OfflineImagePart, OfflineImagePartBuilder,
+    OfflineImageResult,
+};
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
 pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
