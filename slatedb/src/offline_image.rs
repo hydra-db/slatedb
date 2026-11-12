@@ -16,6 +16,7 @@ use slatedb_common::DbRand;
 use crate::block_cache_policy::BlockCachePolicy;
 use crate::config::CompressionCodec;
 use crate::db_state::{SortedRun, SsTableId, SsTableView};
+use crate::filter_policy::FilterPolicy;
 use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::ManifestCore;
@@ -26,7 +27,7 @@ use crate::utils::IdGenerator;
 use crate::{Error, PathResolver};
 
 /// Settings for an [`OfflineImageBuilder`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OfflineImageOptions {
     /// Approximate maximum data-block bytes in each output SST.
     ///
@@ -41,6 +42,15 @@ pub struct OfflineImageOptions {
     /// writer's [`Settings::compression_codec`](crate::config::Settings) so the
     /// image matches the SSTs that compaction writes later.
     pub compression_codec: Option<CompressionCodec>,
+
+    /// Filters built into each output SST.
+    ///
+    /// Set it to the writer's
+    /// [`DbBuilder::with_filter_policies`](crate::DbBuilder::with_filter_policies)
+    /// so the image carries the filters that compaction writes later. A reader
+    /// drops any stored filter whose policy it is not configured with, so a
+    /// policy missing here is one the image's reads can never use.
+    pub filter_policies: Vec<Arc<dyn FilterPolicy>>,
 }
 
 impl Default for OfflineImageOptions {
@@ -48,7 +58,25 @@ impl Default for OfflineImageOptions {
         Self {
             target_sst_size_bytes: 1024 * 1024 * 1024,
             compression_codec: None,
+            filter_policies: SsTableFormat::default().filter_policies,
         }
+    }
+}
+
+impl std::fmt::Debug for OfflineImageOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OfflineImageOptions")
+            .field("target_sst_size_bytes", &self.target_sst_size_bytes)
+            .field("compression_codec", &self.compression_codec)
+            .field(
+                "filter_policies",
+                &self
+                    .filter_policies
+                    .iter()
+                    .map(|policy| policy.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -108,6 +136,7 @@ impl OfflineImageBuilder {
             object_store,
             SsTableFormat {
                 compression_codec: options.compression_codec,
+                filter_policies: options.filter_policies,
                 ..SsTableFormat::default()
             },
             PathResolver::from_root(path),
@@ -226,11 +255,25 @@ fn validate_entry_lengths(key_len: usize, value_len: usize) -> Result<(), Error>
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use bytes::Bytes;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use slatedb_common::clock::DefaultSystemClock;
 
     use super::{validate_entry_lengths, OfflineImageBuilder, OfflineImageOptions};
+    use crate::block_cache_policy::BlockCachePolicy;
+    use crate::config::{
+        CompactionWorkerOptions, CompactorOptions, FlushOptions, FlushType, Settings,
+        SizeTieredCompactionSchedulerOptions,
+    };
+    use crate::filter_policy::{BloomFilterPolicy, FilterPolicy};
+    use crate::format::sst::SsTableFormat;
+    use crate::manifest::store::{ManifestStore, StoredManifest};
+    use crate::object_store_tag::TableStoreKind;
+    use crate::prefix_extractor::{PrefixExtractor, PrefixTarget};
+    use crate::read_trace::ReadTrace;
+    use crate::tablestore::TableStore;
     use crate::{Db, ErrorKind};
 
     #[tokio::test]
@@ -321,6 +364,146 @@ mod tests {
             Some(Bytes::from_static(b"1"))
         );
         db.close().await.unwrap();
+    }
+
+    /// Names of the filters stored in every compacted SST under `root`.
+    async fn compacted_filter_names(
+        store: Arc<dyn ObjectStore>,
+        root: &str,
+        policies: Vec<Arc<dyn FilterPolicy>>,
+    ) -> Vec<Vec<String>> {
+        let manifest = StoredManifest::load(
+            Arc::new(ManifestStore::new(&Path::from(root), store.clone())),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let table_store = TableStore::new(
+            store,
+            SsTableFormat {
+                filter_policies: policies,
+                ..SsTableFormat::default()
+            },
+            Path::from(root),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let mut names = Vec::new();
+        for run in &manifest.db_state().tree.compacted {
+            for view in run.sst_views() {
+                let filters = table_store
+                    .read_filters(&view.sst, false, None, &ReadTrace::none(), None)
+                    .await
+                    .unwrap();
+                names.push(filters.iter().map(|filter| filter.name.clone()).collect());
+            }
+        }
+        names
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_the_filters_compaction_writes() {
+        struct Fixed3;
+        impl PrefixExtractor for Fixed3 {
+            fn name(&self) -> &str {
+                "fixed3"
+            }
+            fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+                let input = match target {
+                    PrefixTarget::Point(key) => key.as_ref(),
+                    PrefixTarget::Prefix(prefix) => prefix.as_ref(),
+                };
+                (input.len() >= 3).then_some(3)
+            }
+        }
+        let policies: Vec<Arc<dyn FilterPolicy>> = vec![
+            Arc::new(BloomFilterPolicy::new(10)),
+            Arc::new(BloomFilterPolicy::new(10).with_prefix_extractor(Arc::new(Fixed3))),
+        ];
+        // Above the writer's default `min_filter_keys`, so compaction output
+        // carries filters at all.
+        let keys = (0..4_000u32)
+            .map(|index| Bytes::from(format!("key-{index:05}")))
+            .collect::<Vec<_>>();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut builder = OfflineImageBuilder::create(
+            Path::from("image"),
+            store.clone(),
+            OfflineImageOptions {
+                filter_policies: policies.clone(),
+                ..OfflineImageOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        for key in &keys {
+            builder
+                .add(key.clone(), Bytes::from_static(b"v"))
+                .await
+                .unwrap();
+        }
+        builder.finish().await.unwrap();
+
+        let settings = Settings {
+            flush_interval: Some(Duration::from_millis(100)),
+            manifest_poll_interval: Duration::from_millis(100),
+            compactor_options: Some(CompactorOptions {
+                poll_interval: Duration::from_millis(100),
+                scheduler_options: SizeTieredCompactionSchedulerOptions {
+                    min_compaction_sources: 1,
+                    ..SizeTieredCompactionSchedulerOptions::default()
+                }
+                .into(),
+                worker: Some(CompactionWorkerOptions {
+                    compactions_poll_interval: Duration::from_millis(100),
+                    ..CompactionWorkerOptions::default()
+                }),
+                ..CompactorOptions::default()
+            }),
+            ..Settings::default()
+        };
+        let db = Db::builder("loaded", store.clone())
+            .with_settings(settings)
+            .with_filter_policies(policies.clone())
+            .build()
+            .await
+            .unwrap();
+        for key in &keys {
+            db.put(key, b"v").await.unwrap();
+        }
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from("loaded"), store.clone()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let manifest =
+                StoredManifest::load(manifest_store.clone(), Arc::new(DefaultSystemClock::new()))
+                    .await
+                    .unwrap();
+            let tree = &manifest.db_state().tree;
+            if tree.l0.is_empty() && !tree.compacted.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the L0 was not compacted"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        db.close().await.unwrap();
+
+        let image = compacted_filter_names(store.clone(), "image", policies.clone()).await;
+        let compacted = compacted_filter_names(store, "loaded", policies).await;
+        assert_eq!(
+            image,
+            vec![vec!["_bf".to_string(), "_bf:p=fixed3".to_string()]]
+        );
+        assert_eq!(image, compacted);
     }
 
     #[tokio::test]
