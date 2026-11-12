@@ -677,7 +677,9 @@ mod tests {
         for keys in keys.chunks(2_000) {
             let mut part = parts.part_builder();
             for key in keys {
-                part.add(key.clone(), Bytes::from_static(b"v")).await.unwrap();
+                part.add(key.clone(), Bytes::from_static(b"v"))
+                    .await
+                    .unwrap();
             }
             parts.add_part(part.finish().await.unwrap()).await.unwrap();
         }
