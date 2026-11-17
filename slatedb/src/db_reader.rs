@@ -442,6 +442,8 @@ impl DbReaderInner {
         let durable_seq = new_state.last_remote_persisted_seq;
         let versioned_manifest = VersionedManifest::from(&new_state);
         let touched_segments = collect_touched_segments(&new_state);
+        // The oracle caps reads, so raise it before the new state is visible. Report the
+        // sequence to status subscribers only after the state that holds it is installed.
         self.oracle.advance_durable_seq(durable_seq);
         let mut write_guard = self.state.write();
         if let Some(checkpoint) = write_guard.checkpoint.as_ref().filter(|checkpoint| {
@@ -455,6 +457,7 @@ impl DbReaderInner {
         }
         *write_guard = Arc::new(new_state);
         drop(write_guard);
+        self.oracle.report_durable_seq(durable_seq);
         self.status_manager
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
     }
@@ -483,6 +486,7 @@ impl DbReaderInner {
         .await?;
 
         if last_wal_id > current_state.last_wal_id {
+            // Same order as `install_state`: oracle, then state, then status.
             self.oracle.advance_durable_seq(last_committed_seq);
             let mut write_guard = self.state.write();
             *write_guard = Arc::new(ReaderState {
@@ -495,6 +499,7 @@ impl DbReaderInner {
                 last_remote_persisted_seq: last_committed_seq,
             });
             drop(write_guard);
+            self.oracle.report_durable_seq(last_committed_seq);
             self.status_manager
                 .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
         }
@@ -2165,6 +2170,129 @@ mod tests {
             manifest_id,
             "WAL replay alone leaves the manifest where it was"
         );
+        db.close().await.unwrap();
+    }
+
+    /// Takes a reader snapshot when the reader status reports a new durable sequence.
+    /// The wake polls the status and takes the snapshot on the thread that reports
+    /// the status. No subscriber can act on a report earlier than that.
+    struct SnapshotOnDurableSeq {
+        reader: Arc<DbReader>,
+        report: std::sync::Mutex<Option<futures::future::BoxFuture<'static, u64>>>,
+        taken: std::sync::Mutex<Option<(u64, Arc<super::DbReaderSnapshot>)>>,
+    }
+
+    impl SnapshotOnDurableSeq {
+        fn watch(reader: &Arc<DbReader>) -> Arc<Self> {
+            let mut status = reader.subscribe();
+            let seen = status.borrow_and_update().durable_seq;
+            let report = Box::pin(async move {
+                let status = status.wait_for(|status| status.durable_seq > seen).await;
+                status.map_or(seen, |status| status.durable_seq)
+            });
+            let probe = Arc::new(Self {
+                reader: Arc::clone(reader),
+                report: std::sync::Mutex::new(Some(report)),
+                taken: std::sync::Mutex::new(None),
+            });
+            // The first poll registers the probe as the waker of the status update.
+            std::task::Wake::wake(Arc::clone(&probe));
+            probe
+        }
+    }
+
+    impl std::task::Wake for SnapshotOnDurableSeq {
+        fn wake(self: Arc<Self>) {
+            let mut report = self.report.lock().unwrap();
+            let Some(pending) = report.as_mut() else {
+                return;
+            };
+            let waker = std::task::Waker::from(Arc::clone(&self));
+            let std::task::Poll::Ready(durable_seq) = pending
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+            else {
+                return;
+            };
+            *report = None;
+            // Snapshot creation has no await point, so one poll completes it.
+            let snapshot = futures::FutureExt::now_or_never(self.reader.snapshot());
+            if let Some(Ok(snapshot)) = snapshot {
+                *self.taken.lock().unwrap() = Some((durable_seq, snapshot));
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::wal_replay(false)]
+    #[case::new_manifest(true)]
+    #[tokio::test]
+    async fn a_snapshot_taken_when_status_reports_a_durable_seq_holds_that_seq(
+        #[case] new_manifest: bool,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_snapshot_on_durable_seq_report");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"value")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+        let reader = Arc::new(
+            test_provider
+                .new_db_reader(
+                    DbReaderOptions {
+                        manifest_poll_interval: Duration::from_secs(60),
+                        ..DbReaderOptions::default()
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        let handle = db.put(b"after", b"value").await.unwrap();
+        let seq = handle.seqnum();
+        handle.await_durable().await.unwrap();
+        assert!(reader.status().durable_seq < seq);
+        let probe = SnapshotOnDurableSeq::watch(&reader);
+        assert!(probe.taken.lock().unwrap().is_none());
+
+        if new_manifest {
+            // A new L0 SST changes the manifest, so the refresh installs a rebuilt state.
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+            reader.refresh().await.unwrap();
+        } else {
+            reader
+                .replay_wal_through(db.last_flushed_wal_id())
+                .await
+                .unwrap();
+        }
+
+        let (durable_seq, snapshot) = probe
+            .taken
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the reader reports the new durable sequence");
+        assert!(durable_seq >= seq);
+        assert!(
+            snapshot.seq() >= durable_seq,
+            "the status reports durable sequence {durable_seq}, but a snapshot is at {}",
+            snapshot.seq()
+        );
+        assert_eq!(
+            snapshot.get(b"after").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        drop(snapshot);
+        reader.close().await.unwrap();
         db.close().await.unwrap();
     }
 
