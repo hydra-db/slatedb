@@ -568,16 +568,23 @@ impl<'a> InternalSstIterator<'a> {
                     FetchTask::Inline(read) => {
                         // Keep the future in the queue if the caller cancels this
                         // next/init await: the block cursor has already advanced.
-                        let blocks = AssertUnwindSafe(read.get_mut())
-                            .catch_unwind()
-                            .await
-                            .map_err(|panic| block_fetch_panic_error(panic, sst_id))??;
+                        let blocks = crate::stall_watch::watch(
+                            "sst_block_fetch",
+                            || format!("sst={sst_id:?} fetch=inline"),
+                            AssertUnwindSafe(read.get_mut()).catch_unwind(),
+                        )
+                        .await
+                        .map_err(|panic| block_fetch_panic_error(panic, sst_id))??;
                         *fetch_task = FetchTask::Finished(blocks);
                     }
                     FetchTask::InFlight(jh) => {
-                        let blocks = jh
-                            .await
-                            .map_err(|join_err| block_fetch_join_error(join_err, sst_id))??;
+                        let blocks = crate::stall_watch::watch(
+                            "sst_block_fetch",
+                            || format!("sst={sst_id:?} fetch=spawned"),
+                            jh,
+                        )
+                        .await
+                        .map_err(|join_err| block_fetch_join_error(join_err, sst_id))??;
                         *fetch_task = FetchTask::Finished(blocks);
                     }
                     FetchTask::Finished(blocks) => {
@@ -669,16 +676,19 @@ impl<'a> InternalSstIterator<'a> {
     async fn ensure_metadata_loaded(&mut self) -> Result<(), SlateDBError> {
         if self.index.is_none() {
             let read_trace = self.read_trace();
-            let index = self
-                .table_store
-                .read_index(
+            let sst_id = self.view.table_as_ref().sst.id;
+            let index = crate::stall_watch::watch(
+                "sst_index_load",
+                || format!("sst={sst_id:?}"),
+                self.table_store.read_index(
                     &self.view.table_as_ref().sst,
                     self.options.cache_metadata,
                     self.options.segment.clone(),
                     &read_trace,
                     self.sst_level(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             let block_idx_range = partitioned_keyspace::partitions_covering_range(
                 &index.borrow(),
                 self.view.start_key(),
@@ -917,16 +927,19 @@ impl<'a> FilterIterator<'a> {
 
     async fn read_filters(&self) -> Result<Arc<[NamedFilter]>, SlateDBError> {
         let read_trace = self.inner.read_trace();
-        self.inner
-            .table_store()
-            .read_filters(
+        let sst_id = self.inner.view().table_as_ref().sst.id;
+        crate::stall_watch::watch(
+            "sst_filter_load",
+            || format!("sst={sst_id:?}"),
+            self.inner.table_store().read_filters(
                 &self.inner.view().table_as_ref().sst,
                 self.inner.options.cache_metadata,
                 self.inner.options.segment.clone(),
                 &read_trace,
                 self.inner.sst_level(),
-            )
-            .await
+            ),
+        )
+        .await
     }
 }
 
