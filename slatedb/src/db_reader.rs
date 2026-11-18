@@ -1937,7 +1937,8 @@ mod tests {
     use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
     use {
         super::{
-            DbReaderMessage, ManifestPoller, ReaderCheckpointGeneration, ReaderState, WalReplayEnd,
+            DbReaderMessage, DbReaderSnapshot, ManifestPoller, ReaderCheckpointGeneration,
+            ReaderState, WalReplayEnd,
         },
         crate::{
             block_cache_policy::BlockCachePolicy,
@@ -1975,6 +1976,7 @@ mod tests {
         },
         bytes::Bytes,
         fail_parallel::FailPointRegistry,
+        futures::{future::BoxFuture, FutureExt as _},
         object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt},
         rstest::rstest,
         slatedb_common::{
@@ -1985,8 +1987,9 @@ mod tests {
             collections::{BTreeMap, BTreeSet, VecDeque},
             sync::{
                 atomic::{AtomicUsize, Ordering},
-                Arc,
+                Arc, Mutex,
             },
+            task::{Context, Poll, Wake, Waker},
             time::Duration,
         },
         uuid::Uuid,
@@ -2173,13 +2176,20 @@ mod tests {
         db.close().await.unwrap();
     }
 
-    /// Takes a reader snapshot when the reader status reports a new durable sequence.
-    /// The wake polls the status and takes the snapshot on the thread that reports
-    /// the status. No subscriber can act on a report earlier than that.
+    /// Test helper. It takes a reader snapshot when the reader status reports a new
+    /// durable sequence. The wake polls the status and takes the snapshot on the thread
+    /// that reports the status. No subscriber can act on a report earlier than that.
+    ///
+    /// The mutexes only make the helper `Sync`, which `Wake` requires. A wake holds
+    /// `report` for one poll of the status. That poll does not wake the helper, so a
+    /// thread never locks `report` twice.
     struct SnapshotOnDurableSeq {
         reader: Arc<DbReader>,
-        report: std::sync::Mutex<Option<futures::future::BoxFuture<'static, u64>>>,
-        taken: std::sync::Mutex<Option<(u64, Arc<super::DbReaderSnapshot>)>>,
+        /// Resolves to the new durable sequence. `None` after it resolves.
+        report: Mutex<Option<BoxFuture<'static, u64>>>,
+        /// The reported sequence, and the snapshot taken in the same wake. The snapshot
+        /// is `None` if `DbReader::snapshot` did not complete in one poll.
+        taken: Mutex<Option<(u64, Option<Arc<DbReaderSnapshot>>)>>,
     }
 
     impl SnapshotOnDurableSeq {
@@ -2192,34 +2202,31 @@ mod tests {
             });
             let probe = Arc::new(Self {
                 reader: Arc::clone(reader),
-                report: std::sync::Mutex::new(Some(report)),
-                taken: std::sync::Mutex::new(None),
+                report: Mutex::new(Some(report)),
+                taken: Mutex::new(None),
             });
-            // The first poll registers the probe as the waker of the status update.
-            std::task::Wake::wake(Arc::clone(&probe));
+            // The first poll registers the helper as the waker of the status update.
+            Arc::clone(&probe).wake();
             probe
         }
     }
 
-    impl std::task::Wake for SnapshotOnDurableSeq {
+    impl Wake for SnapshotOnDurableSeq {
         fn wake(self: Arc<Self>) {
             let mut report = self.report.lock().unwrap();
             let Some(pending) = report.as_mut() else {
                 return;
             };
-            let waker = std::task::Waker::from(Arc::clone(&self));
-            let std::task::Poll::Ready(durable_seq) = pending
-                .as_mut()
-                .poll(&mut std::task::Context::from_waker(&waker))
+            let waker = Waker::from(Arc::clone(&self));
+            let Poll::Ready(durable_seq) = pending.as_mut().poll(&mut Context::from_waker(&waker))
             else {
                 return;
             };
             *report = None;
-            // Snapshot creation has no await point, so one poll completes it.
-            let snapshot = futures::FutureExt::now_or_never(self.reader.snapshot());
-            if let Some(Ok(snapshot)) = snapshot {
-                *self.taken.lock().unwrap() = Some((durable_seq, snapshot));
-            }
+            // A wake cannot wait, so the snapshot gets one poll. The test fails with a
+            // clear message if that poll does not complete.
+            let snapshot = self.reader.snapshot().now_or_never();
+            *self.taken.lock().unwrap() = Some((durable_seq, snapshot.and_then(Result::ok)));
         }
     }
 
@@ -2281,6 +2288,7 @@ mod tests {
             .unwrap()
             .take()
             .expect("the reader reports the new durable sequence");
+        let snapshot = snapshot.expect("DbReader::snapshot completes in one poll, without a wait");
         assert!(durable_seq >= seq);
         assert!(
             snapshot.seq() >= durable_seq,
