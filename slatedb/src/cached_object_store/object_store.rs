@@ -566,7 +566,13 @@ impl CachedObjectStore {
         Box::pin(async move {
             let entry = this.cache_storage.entry(&location, this.part_size_bytes);
             if !force_refresh {
-                if let Ok(Some(bytes)) = entry.read_part(part_id, range_in_part.clone()).await {
+                let disk_read = crate::stall_watch::watch(
+                    "disk_cache_part_read",
+                    || format!("path={location} part={part_id}"),
+                    entry.read_part(part_id, range_in_part.clone()),
+                )
+                .await;
+                if let Ok(Some(bytes)) = disk_read {
                     return Ok((bytes, ReadResultSource::Disk));
                 }
             }
@@ -575,27 +581,36 @@ impl CachedObjectStore {
             // Read Part — deduplicate concurrent fetches of the same part.
             // The SingleFlight fetches the full part and saves it to cache; each
             // caller then copies out their own range_in_part.
-            let bytes = this
+            let led = std::sync::atomic::AtomicBool::new(false);
+            let flight = this
                 .part_flights
                 .call((location.clone(), part_id), || async {
+                    led.store(true, std::sync::atomic::Ordering::Relaxed);
                     let part_range = Range {
                         start: (part_id * this.part_size_bytes) as u64,
                         end: ((part_id + 1) * this.part_size_bytes) as u64,
                     };
-                    let get_result = this
-                        .object_store
-                        .get_opts(
-                            &location,
-                            GetOptions {
-                                range: Some(GetRange::Bounded(part_range.clone())),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
-
-                    let meta = get_result.meta.clone();
-                    let attrs = get_result.attributes.clone();
-                    let bytes = get_result.bytes().await?;
+                    let (meta, attrs, bytes) = crate::stall_watch::watch(
+                        "object_store_part_get",
+                        || format!("path={location} part={part_id} range={part_range:?}"),
+                        async {
+                            let get_result = this
+                                .object_store
+                                .get_opts(
+                                    &location,
+                                    GetOptions {
+                                        range: Some(GetRange::Bounded(part_range.clone())),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
+                            let meta = get_result.meta.clone();
+                            let attrs = get_result.attributes.clone();
+                            let bytes = get_result.bytes().await?;
+                            Ok::<_, object_store::Error>((meta, attrs, bytes))
+                        },
+                    )
+                    .await?;
 
                     // A truncated but successful ranged body is possible and
                     // should be caught here because the rest of the code
@@ -631,12 +646,29 @@ impl CachedObjectStore {
 
                     // Save the head and the part to cache for future accesses.
                     let entry = this.cache_storage.entry(&location, this.part_size_bytes);
-                    entry.save_head((&meta, &attrs)).await.ok();
-                    entry.save_part(part_id, bytes.clone()).await.ok();
+                    crate::stall_watch::watch(
+                        "disk_cache_part_save",
+                        || format!("path={location} part={part_id}"),
+                        async {
+                            entry.save_head((&meta, &attrs)).await.ok();
+                            entry.save_part(part_id, bytes.clone()).await.ok();
+                        },
+                    )
+                    .await;
 
                     Ok::<_, object_store::Error>(bytes)
-                })
-                .await?;
+                });
+            let bytes = crate::stall_watch::watch(
+                "part_fetch_flight",
+                || {
+                    format!(
+                        "path={location} part={part_id} led={}",
+                        led.load(std::sync::atomic::Ordering::Relaxed)
+                    )
+                },
+                flight,
+            )
+            .await?;
 
             Ok((
                 Bytes::copy_from_slice(&bytes[range_in_part]),

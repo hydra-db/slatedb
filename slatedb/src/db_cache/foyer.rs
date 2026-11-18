@@ -201,10 +201,22 @@ impl FoyerCache {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         let (loader, loader_ran) = instrumented_loader(loader);
+        let described_key = key.clone();
         let fetch = self
             .inner
             .get_or_fetch(&key, move || async move { loader().await });
-        match fetch.await {
+        let fetched = crate::stall_watch::watch(
+            "block_cache_fetch",
+            || {
+                format!(
+                    "key={described_key:?} loader_ran={}",
+                    loader_ran.was_called()
+                )
+            },
+            fetch,
+        )
+        .await;
+        match fetched {
             Ok(entry) => Ok(CacheFetch {
                 entry: entry.value().clone(),
                 lookup: if loader_ran.was_called() {

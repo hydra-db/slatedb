@@ -98,6 +98,7 @@ pub mod object_store_tag;
 pub mod prefix_extractor;
 pub mod seq_tracker;
 pub mod size_tiered_compaction;
+pub mod stall_watch;
 pub mod wal;
 
 mod batch;
