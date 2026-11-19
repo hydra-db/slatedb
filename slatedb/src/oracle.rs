@@ -90,8 +90,15 @@ impl DbReaderOracle {
         }
     }
 
+    /// Raises the sequence that caps reads. Status subscribers do not see the sequence
+    /// until [`Self::report_durable_seq`]. Only the reader's `InstalledState` calls
+    /// the two, with the state swap between them.
     pub(crate) fn advance_durable_seq(&self, seq: u64) {
         self.last_remote_persisted_seq.fetch_max(seq, SeqCst);
+    }
+
+    /// Reports the durable sequence to status subscribers.
+    pub(crate) fn report_durable_seq(&self, seq: u64) {
         self.status_reporter.report_durable_seq(seq);
     }
 }
