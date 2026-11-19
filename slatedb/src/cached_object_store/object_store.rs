@@ -266,13 +266,16 @@ impl CachedObjectStore {
         }
 
         // Cache miss — deduplicate concurrent HEAD requests for the same path.
+        // The flight owns what it uses: another caller may finish it.
+        let this = self.clone();
+        let path = location.clone();
         let (meta, attributes, extensions) = self
             .head_flights
-            .call(location.clone(), || async {
-                let result = self
+            .call(location.clone(), || async move {
+                let result = this
                     .object_store
                     .get_opts(
-                        location,
+                        &path,
                         GetOptions {
                             range: None,
                             head: true,
@@ -285,7 +288,7 @@ impl CachedObjectStore {
                 let extensions = result.extensions.clone();
 
                 if admit_on_miss {
-                    self.save_get_result(location, result).await.ok();
+                    this.save_get_result(&path, result).await.ok();
                 }
                 Ok::<_, object_store::Error>((meta, attributes, extensions))
             })
@@ -419,18 +422,21 @@ impl CachedObjectStore {
         // Only one caller performs the fetch+save; others share the metadata result.
         // Parts not covered by the winning caller's range are handled by read_part's
         // own object-store fallback, so correctness is maintained.
+        // The flight owns what it uses: another caller may finish it.
+        let this = self.clone();
+        let path = location.clone();
         self.prefetch_flights
             .call(
                 (location.clone(), opts.range.clone().map(Into::into)),
-                || async {
-                    let get_result = self.object_store.get_opts(location, opts).await?;
+                || async move {
+                    let get_result = this.object_store.get_opts(&path, opts).await?;
                     let result_meta = get_result.meta.clone();
                     let result_attrs = get_result.attributes.clone();
                     let result_extensions = get_result.extensions.clone();
                     // swallow the error on saving to disk here (the disk might be already full), just fallback
                     // to the object store.
                     // TODO: add a warning log here
-                    self.save_get_result(location, get_result).await.ok();
+                    this.save_get_result(&path, get_result).await.ok();
                     Ok((result_meta, result_attrs, result_extensions))
                 },
             )
@@ -581,23 +587,28 @@ impl CachedObjectStore {
             // Read Part — deduplicate concurrent fetches of the same part.
             // The SingleFlight fetches the full part and saves it to cache; each
             // caller then copies out their own range_in_part.
-            let led = std::sync::atomic::AtomicBool::new(false);
+            // `led` is true when this caller's func ran. The flight owns what it
+            // uses, because another caller may finish it.
+            let led = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let started = Arc::clone(&led);
+            let store = this.clone();
+            let path = location.clone();
             let flight = this
                 .part_flights
-                .call((location.clone(), part_id), || async {
-                    led.store(true, std::sync::atomic::Ordering::Relaxed);
+                .call((location.clone(), part_id), || async move {
+                    started.store(true, std::sync::atomic::Ordering::Relaxed);
                     let part_range = Range {
-                        start: (part_id * this.part_size_bytes) as u64,
-                        end: ((part_id + 1) * this.part_size_bytes) as u64,
+                        start: (part_id * store.part_size_bytes) as u64,
+                        end: ((part_id + 1) * store.part_size_bytes) as u64,
                     };
                     let (meta, attrs, bytes) = crate::stall_watch::watch(
                         "object_store_part_get",
-                        || format!("path={location} part={part_id} range={part_range:?}"),
+                        || format!("path={path} part={part_id} range={part_range:?}"),
                         async {
-                            let get_result = this
+                            let get_result = store
                                 .object_store
                                 .get_opts(
-                                    &location,
+                                    &path,
                                     GetOptions {
                                         range: Some(GetRange::Bounded(part_range.clone())),
                                         ..Default::default()
@@ -645,10 +656,10 @@ impl CachedObjectStore {
                     }
 
                     // Save the head and the part to cache for future accesses.
-                    let entry = this.cache_storage.entry(&location, this.part_size_bytes);
+                    let entry = store.cache_storage.entry(&path, store.part_size_bytes);
                     crate::stall_watch::watch(
                         "disk_cache_part_save",
-                        || format!("path={location} part={part_id}"),
+                        || format!("path={path} part={part_id}"),
                         async {
                             entry.save_head((&meta, &attrs)).await.ok();
                             entry.save_part(part_id, bytes.clone()).await.ok();

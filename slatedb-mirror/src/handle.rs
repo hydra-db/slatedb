@@ -126,7 +126,7 @@ impl MirrorHandle {
     }
 }
 
-async fn fetch_one(inner: &Inner, path: Path, ticket: Ticket) -> object_store::Result<()> {
+async fn fetch_one(inner: &Arc<Inner>, path: Path, ticket: Ticket) -> object_store::Result<()> {
     // Downloads are never cancelled.
     ticket.ready().await;
     if inner.entries.lock().contains_key(&path) {
