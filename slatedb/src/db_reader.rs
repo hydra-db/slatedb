@@ -142,14 +142,13 @@ struct DbReaderInner {
     wal_reader: Arc<dyn WalReaderTrait>,
     options: DbReaderOptions,
     mode: DbReaderMode,
-    state: RwLock<Arc<ReaderState>>,
+    state: InstalledState,
     refresh_gate: Mutex<()>,
     retired_checkpoints: RwLock<Vec<(Checkpoint, Weak<ReaderCheckpointGeneration>)>>,
     close_gate: Mutex<()>,
     closing: AtomicBool,
     active_snapshots: AtomicUsize,
     system_clock: Arc<dyn SystemClock>,
-    oracle: Arc<DbReaderOracle>,
     reader: Reader,
     status_manager: DbStatusManager,
     segment_extractor: Option<Arc<dyn PrefixExtractor>>,
@@ -182,6 +181,79 @@ struct ReaderState {
     imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
     last_wal_id: u64,
     last_remote_persisted_seq: u64,
+}
+
+use installed_state::InstalledState;
+
+/// The state that a reader serves, and the only way to replace it.
+///
+/// A reader shows a new durable sequence in three places. The oracle caps reads at
+/// the sequence. The state holds the entries. The status reports the sequence to
+/// subscribers. A new sequence must reach them in that order:
+///
+/// - Oracle before state. A snapshot of the new state must read all of its entries.
+/// - State before status. A subscriber can take a snapshot when it sees the report,
+///   and that snapshot must hold the reported sequence.
+///
+/// The state is private to this module. [`InstalledState::install`] is thus the only
+/// code that can show a new sequence, and no caller can use a different order.
+mod installed_state {
+    use super::{Checkpoint, DbReaderOracle, ReaderState};
+    use parking_lot::{RwLock, RwLockReadGuard};
+    use std::sync::Arc;
+
+    pub(super) struct InstalledState {
+        state: RwLock<Arc<ReaderState>>,
+        oracle: Arc<DbReaderOracle>,
+    }
+
+    impl InstalledState {
+        /// `oracle` must already admit the durable sequence of `initial`.
+        pub(super) fn new(initial: Arc<ReaderState>, oracle: Arc<DbReaderOracle>) -> Self {
+            Self {
+                state: RwLock::new(initial),
+                oracle,
+            }
+        }
+
+        pub(super) fn read(&self) -> RwLockReadGuard<'_, Arc<ReaderState>> {
+            self.state.read()
+        }
+
+        /// Makes `new_state` the state that the reader serves.
+        ///
+        /// `before_swap` gets the state to replace, then `new_state`. It runs when the
+        /// oracle admits the new sequence and readers still get the old state.
+        pub(super) fn install(
+            &self,
+            new_state: ReaderState,
+            before_swap: impl FnOnce(&ReaderState, &ReaderState),
+        ) {
+            let durable_seq = new_state.last_remote_persisted_seq;
+            self.oracle.advance_durable_seq(durable_seq);
+            {
+                let mut state = self.state.write();
+                before_swap(&state, &new_state);
+                *state = Arc::new(new_state);
+            }
+            self.oracle.report_durable_seq(durable_seq);
+        }
+
+        /// Replaces the checkpoint lease `held` with `refreshed`. Does nothing if the
+        /// state holds a different lease. The durable sequence does not change, so
+        /// there is nothing to report.
+        pub(super) fn refresh_checkpoint(&self, held: &Checkpoint, refreshed: Checkpoint) {
+            let mut state = self.state.write();
+            let holds_lease = state.checkpoint.as_ref().is_some_and(|current| {
+                current.id == held.id && current.expire_time == held.expire_time
+            });
+            if holds_lease {
+                let mut updated = ReaderState::clone(&state);
+                updated.checkpoint = Some(refreshed);
+                *state = Arc::new(updated);
+            }
+        }
+    }
 }
 
 static EMPTY_TABLE: LazyLock<Arc<KVTable>> = LazyLock::new(|| Arc::new(KVTable::new()));
@@ -286,12 +358,12 @@ impl DbReaderInner {
 
         let db_stats = DbStats::new(&recorder);
 
-        let state = RwLock::new(initial_state);
+        let state = InstalledState::new(initial_state, Arc::clone(&oracle));
         let reader = Reader::new(
             Arc::clone(&table_store),
             db_stats,
             Arc::clone(&mono_clock),
-            oracle.clone(),
+            oracle,
             merge_operator,
         );
 
@@ -308,7 +380,6 @@ impl DbReaderInner {
             closing: AtomicBool::new(false),
             active_snapshots: AtomicUsize::new(0),
             system_clock,
-            oracle,
             reader,
             status_manager,
             segment_extractor,
@@ -439,25 +510,18 @@ impl DbReaderInner {
     }
 
     fn install_state(&self, new_state: ReaderState) {
-        let durable_seq = new_state.last_remote_persisted_seq;
         let versioned_manifest = VersionedManifest::from(&new_state);
         let touched_segments = collect_touched_segments(&new_state);
-        // The oracle caps reads, so raise it before the new state is visible. Report the
-        // sequence to status subscribers only after the state that holds it is installed.
-        self.oracle.advance_durable_seq(durable_seq);
-        let mut write_guard = self.state.write();
-        if let Some(checkpoint) = write_guard.checkpoint.as_ref().filter(|checkpoint| {
-            self.mode == DbReaderMode::ManagedCheckpoint
-                && new_state.checkpoint.as_ref().map(|next| next.id) != Some(checkpoint.id)
-        }) {
-            self.retired_checkpoints.write().push((
-                checkpoint.clone(),
-                Arc::downgrade(&write_guard.checkpoint_pin),
-            ));
-        }
-        *write_guard = Arc::new(new_state);
-        drop(write_guard);
-        self.oracle.report_durable_seq(durable_seq);
+        self.state.install(new_state, |replaced, new_state| {
+            if let Some(checkpoint) = replaced.checkpoint.as_ref().filter(|checkpoint| {
+                self.mode == DbReaderMode::ManagedCheckpoint
+                    && new_state.checkpoint.as_ref().map(|next| next.id) != Some(checkpoint.id)
+            }) {
+                self.retired_checkpoints
+                    .write()
+                    .push((checkpoint.clone(), Arc::downgrade(&replaced.checkpoint_pin)));
+            }
+        });
         self.status_manager
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
     }
@@ -486,10 +550,7 @@ impl DbReaderInner {
         .await?;
 
         if last_wal_id > current_state.last_wal_id {
-            // Same order as `install_state`: oracle, then state, then status.
-            self.oracle.advance_durable_seq(last_committed_seq);
-            let mut write_guard = self.state.write();
-            *write_guard = Arc::new(ReaderState {
+            let replayed_state = ReaderState {
                 manifest_id: current_state.manifest_id,
                 checkpoint: current_state.checkpoint.clone(),
                 checkpoint_pin: Arc::clone(&current_state.checkpoint_pin),
@@ -497,9 +558,9 @@ impl DbReaderInner {
                 imm_memtable,
                 last_wal_id,
                 last_remote_persisted_seq: last_committed_seq,
-            });
-            drop(write_guard);
-            self.oracle.report_durable_seq(last_committed_seq);
+            };
+            self.state
+                .install(replayed_state, |_replaced, _new_state| {});
             self.status_manager
                 .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
         }
@@ -673,23 +734,8 @@ impl DbReaderInner {
 
             // Update our local checkpoint copy so we know the latest expiration time
             // and can calculate future refresh deadlines correctly.
-            {
-                let mut write_guard = self.state.write();
-                let current_state = write_guard.as_ref();
-                // Defensively, only update checkpoint if the id and expiry still match.
-                if current_state
-                    .checkpoint
-                    .as_ref()
-                    .is_some_and(|current_checkpoint| {
-                        current_checkpoint.id == checkpoint.id
-                            && current_checkpoint.expire_time == checkpoint.expire_time
-                    })
-                {
-                    let mut updated_state = current_state.clone();
-                    updated_state.checkpoint = Some(refreshed_checkpoint.clone());
-                    *write_guard = Arc::new(updated_state);
-                }
-            }
+            self.state
+                .refresh_checkpoint(&checkpoint, refreshed_checkpoint.clone());
 
             info!(
                 "refreshed checkpoint [checkpoint_id={}, expire_time={:?}]",
@@ -1937,8 +1983,8 @@ mod tests {
     use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
     use {
         super::{
-            DbReaderMessage, DbReaderSnapshot, ManifestPoller, ReaderCheckpointGeneration,
-            ReaderState, WalReplayEnd,
+            DbReaderMessage, DbReaderSnapshot, InstalledState, ManifestPoller,
+            ReaderCheckpointGeneration, ReaderState, WalReplayEnd,
         },
         crate::{
             block_cache_policy::BlockCachePolicy,
@@ -1950,7 +1996,7 @@ mod tests {
             db_reader::{DbReader, DbReaderInner, DbReaderMode, DbReaderOptions},
             db_state::SstType,
             db_stats::DbStats,
-            db_status::DbStatusManager,
+            db_status::{DbStatus, DbStatusManager},
             dispatcher::MessageHandler,
             error::SlateDBError,
             format::sst::SsTableFormat,
@@ -1961,9 +2007,9 @@ mod tests {
             },
             mem_table::{ImmutableMemtable, WritableKVTable},
             merge_operator::MergeOperatorType,
-            oracle::DbReaderOracle,
+            oracle::{DbReaderOracle, Oracle},
             paths::PathResolver,
-            proptest_util::{rng::new_test_rng, sample},
+            proptest_util::{self, rng::new_test_rng, sample},
             reader::Reader,
             tablestore::{TableStore, TableStoreKind},
             test_utils,
@@ -1978,6 +2024,10 @@ mod tests {
         fail_parallel::FailPointRegistry,
         futures::{future::BoxFuture, FutureExt as _},
         object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt},
+        proptest::{
+            prelude::{prop_assert, Just},
+            prop_oneof,
+        },
         rstest::rstest,
         slatedb_common::{
             clock::{DefaultSystemClock, SystemClock},
@@ -1992,6 +2042,7 @@ mod tests {
             task::{Context, Poll, Wake, Waker},
             time::Duration,
         },
+        tokio::sync::watch,
         uuid::Uuid,
     };
 
@@ -2176,130 +2227,255 @@ mod tests {
         db.close().await.unwrap();
     }
 
-    /// Test helper. It takes a reader snapshot when the reader status reports a new
-    /// durable sequence. The wake polls the status and takes the snapshot on the thread
-    /// that reports the status. No subscriber can act on a report earlier than that.
+    /// Test helper. It records what a status subscriber gets if it takes a snapshot at
+    /// each report of a new durable sequence. The wake polls the status and takes the
+    /// snapshot on the thread that reports the status. No subscriber can act on a
+    /// report earlier than that.
     ///
     /// The mutexes only make the helper `Sync`, which `Wake` requires. A wake holds
-    /// `report` for one poll of the status. That poll does not wake the helper, so a
-    /// thread never locks `report` twice.
-    struct SnapshotOnDurableSeq {
+    /// `next_report` while it polls the status. That poll does not wake the helper, so
+    /// a thread never locks `next_report` twice.
+    struct SnapshotAtEachReport {
         reader: Arc<DbReader>,
-        /// Resolves to the new durable sequence. `None` after it resolves.
-        report: Mutex<Option<BoxFuture<'static, u64>>>,
-        /// The reported sequence, and the snapshot taken in the same wake. The snapshot
-        /// is `None` if `DbReader::snapshot` did not complete in one poll.
-        taken: Mutex<Option<(u64, Option<Arc<DbReaderSnapshot>>)>>,
+        /// Resolves at the next new durable sequence, to that sequence. It also gives
+        /// back the status receiver, to wait for the report after that.
+        next_report: Mutex<BoxFuture<'static, (watch::Receiver<DbStatus>, u64)>>,
+        taken: Mutex<Vec<SnapshotAtReport>>,
     }
 
-    impl SnapshotOnDurableSeq {
+    /// Test helper. One report of a new durable sequence, and the snapshot taken in the
+    /// same wake. The snapshot is `None` if `DbReader::snapshot` did not complete in
+    /// one poll. A wake cannot wait, so one poll is all that the snapshot gets.
+    struct SnapshotAtReport {
+        reported_seq: u64,
+        snapshot: Option<Result<Arc<DbReaderSnapshot>, crate::Error>>,
+    }
+
+    impl SnapshotAtEachReport {
         fn watch(reader: &Arc<DbReader>) -> Arc<Self> {
             let mut status = reader.subscribe();
             let seen = status.borrow_and_update().durable_seq;
-            let report = Box::pin(async move {
-                let status = status.wait_for(|status| status.durable_seq > seen).await;
-                status.map_or(seen, |status| status.durable_seq)
-            });
             let probe = Arc::new(Self {
                 reader: Arc::clone(reader),
-                report: Mutex::new(Some(report)),
-                taken: Mutex::new(None),
+                next_report: Mutex::new(Self::next_report(status, seen)),
+                taken: Mutex::new(Vec::new()),
             });
             // The first poll registers the helper as the waker of the status update.
             Arc::clone(&probe).wake();
             probe
         }
-    }
 
-    impl Wake for SnapshotOnDurableSeq {
-        fn wake(self: Arc<Self>) {
-            let mut report = self.report.lock().unwrap();
-            let Some(pending) = report.as_mut() else {
-                return;
-            };
-            let waker = Waker::from(Arc::clone(&self));
-            let Poll::Ready(durable_seq) = pending.as_mut().poll(&mut Context::from_waker(&waker))
-            else {
-                return;
-            };
-            *report = None;
-            // A wake cannot wait, so the snapshot gets one poll. The test fails with a
-            // clear message if that poll does not complete.
-            let snapshot = self.reader.snapshot().now_or_never();
-            *self.taken.lock().unwrap() = Some((durable_seq, snapshot.and_then(Result::ok)));
+        fn next_report(
+            mut status: watch::Receiver<DbStatus>,
+            seen: u64,
+        ) -> BoxFuture<'static, (watch::Receiver<DbStatus>, u64)> {
+            Box::pin(async move {
+                let reported = status.wait_for(|status| status.durable_seq > seen).await;
+                let Ok(reported_seq) = reported.map(|status| status.durable_seq) else {
+                    // The reader is gone, so there are no more reports.
+                    return std::future::pending().await;
+                };
+                (status, reported_seq)
+            })
+        }
+
+        fn take(&self) -> Vec<SnapshotAtReport> {
+            std::mem::take(&mut self.taken.lock().unwrap())
         }
     }
 
-    #[rstest]
-    #[case::wal_replay(false)]
-    #[case::new_manifest(true)]
-    #[tokio::test]
-    async fn a_snapshot_taken_when_status_reports_a_durable_seq_holds_that_seq(
-        #[case] new_manifest: bool,
-    ) {
+    impl Wake for SnapshotAtEachReport {
+        fn wake(self: Arc<Self>) {
+            let mut next_report = self.next_report.lock().unwrap();
+            let waker = Waker::from(Arc::clone(&self));
+            while let Poll::Ready((status, reported_seq)) =
+                next_report.as_mut().poll(&mut Context::from_waker(&waker))
+            {
+                let snapshot = self.reader.snapshot().now_or_never();
+                self.taken.lock().unwrap().push(SnapshotAtReport {
+                    reported_seq,
+                    snapshot,
+                });
+                *next_report = Self::next_report(status, reported_seq);
+            }
+        }
+    }
+
+    /// Test helper. One thing that a writer or its reader does.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// The writer makes one more write durable.
+        Put,
+        /// The writer flushes its memtable to an L0 SST. This changes the manifest.
+        FlushMemtable,
+        /// The reader replays the WAL through the last file that the writer flushed.
+        ReplayWal,
+        /// The reader refreshes from the manifest.
+        Refresh,
+    }
+
+    /// Test helper. What a status subscriber got at one report of a new durable
+    /// sequence.
+    #[derive(Debug)]
+    struct SeenAtReport {
+        reported_seq: u64,
+        /// The sequence of the snapshot taken in the same wake.
+        snapshot_seq: u64,
+        /// The number of writes at or below `reported_seq` that the snapshot does not
+        /// read.
+        unread_writes: usize,
+    }
+
+    impl SeenAtReport {
+        fn snapshot_holds_the_report(&self) -> bool {
+            self.snapshot_seq >= self.reported_seq && self.unread_writes == 0
+        }
+    }
+
+    const STEP_VALUE: &[u8] = b"value";
+
+    /// Runs `steps` on a new database and a reader that follows the database only when
+    /// a step tells it to. Returns what a status subscriber got at each report.
+    async fn seen_at_each_report(steps: &[Step]) -> Vec<SeenAtReport> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("/tmp/test_snapshot_on_durable_seq_report");
-        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let test_provider = TestProvider::new(Path::from("/tmp/test_reports"), object_store);
         let db = test_provider.new_db(Settings::default()).await.unwrap();
-        db.put(b"before", b"value")
-            .await
-            .unwrap()
-            .await_durable()
-            .await
-            .unwrap();
+        let reader_options = DbReaderOptions {
+            manifest_poll_interval: Duration::from_secs(60),
+            ..DbReaderOptions::default()
+        };
         let reader = Arc::new(
             test_provider
-                .new_db_reader(
-                    DbReaderOptions {
-                        manifest_poll_interval: Duration::from_secs(60),
-                        ..DbReaderOptions::default()
-                    },
-                    None,
-                    None,
-                )
+                .new_db_reader(reader_options, None, None)
                 .await
                 .unwrap(),
         );
-        let handle = db.put(b"after", b"value").await.unwrap();
-        let seq = handle.seqnum();
-        handle.await_durable().await.unwrap();
-        assert!(reader.status().durable_seq < seq);
-        let probe = SnapshotOnDurableSeq::watch(&reader);
-        assert!(probe.taken.lock().unwrap().is_none());
+        let probe = SnapshotAtEachReport::watch(&reader);
 
-        if new_manifest {
-            // A new L0 SST changes the manifest, so the refresh installs a rebuilt state.
-            db.flush_with_options(FlushOptions {
-                flush_type: FlushType::MemTable,
-            })
-            .await
-            .unwrap();
-            reader.refresh().await.unwrap();
-        } else {
-            reader
-                .replay_wal_through(db.last_flushed_wal_id())
-                .await
-                .unwrap();
+        let mut writes = Vec::new();
+        for step in steps {
+            match step {
+                Step::Put => {
+                    let key = format!("key-{}", writes.len());
+                    let handle = db.put(key.as_bytes(), STEP_VALUE).await.unwrap();
+                    writes.push((handle.seqnum(), key));
+                    handle.await_durable().await.unwrap();
+                }
+                Step::FlushMemtable => db
+                    .flush_with_options(FlushOptions {
+                        flush_type: FlushType::MemTable,
+                    })
+                    .await
+                    .unwrap(),
+                Step::ReplayWal => reader
+                    .replay_wal_through(db.last_flushed_wal_id())
+                    .await
+                    .unwrap(),
+                Step::Refresh => reader.refresh().await.unwrap(),
+            }
         }
 
-        let (durable_seq, snapshot) = probe
-            .taken
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the reader reports the new durable sequence");
-        let snapshot = snapshot.expect("DbReader::snapshot completes in one poll, without a wait");
-        assert!(durable_seq >= seq);
-        assert!(
-            snapshot.seq() >= durable_seq,
-            "the status reports durable sequence {durable_seq}, but a snapshot is at {}",
-            snapshot.seq()
-        );
+        let mut seen = Vec::new();
+        for SnapshotAtReport {
+            reported_seq,
+            snapshot,
+        } in probe.take()
+        {
+            let snapshot = snapshot
+                .expect("DbReader::snapshot completes in one poll, without a wait")
+                .unwrap();
+            let mut unread_writes = 0;
+            for (_, key) in writes.iter().filter(|(seq, _)| *seq <= reported_seq) {
+                if snapshot.get(key.as_bytes()).await.unwrap().as_deref() != Some(STEP_VALUE) {
+                    unread_writes += 1;
+                }
+            }
+            seen.push(SeenAtReport {
+                reported_seq,
+                snapshot_seq: snapshot.seq(),
+                unread_writes,
+            });
+        }
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+        seen
+    }
+
+    #[rstest]
+    #[case::wal_replay(&[Step::Put, Step::ReplayWal])]
+    #[case::new_manifest(&[Step::Put, Step::FlushMemtable, Step::Refresh])]
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_taken_at_a_durable_seq_report_holds_that_seq(#[case] steps: &[Step]) {
+        let seen = seen_at_each_report(steps).await;
+
+        assert_eq!(seen.len(), 1, "one write gives one report: {seen:?}");
+        assert!(seen[0].snapshot_holds_the_report(), "{seen:?}");
+    }
+
+    const MAX_STEPS: usize = 12;
+
+    #[test]
+    fn a_snapshot_taken_at_any_durable_seq_report_holds_that_seq() {
+        let step = prop_oneof![
+            Just(Step::Put),
+            Just(Step::FlushMemtable),
+            Just(Step::ReplayWal),
+            Just(Step::Refresh),
+        ];
+        let steps = proptest::collection::vec(step, 1..=MAX_STEPS);
+        // Time is paused, so a write does not wait in real time for the WAL flush.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        proptest_util::runner::new(file!(), None)
+            .run(&steps, |steps| {
+                let seen = runtime.block_on(seen_at_each_report(&steps));
+                let stale: Vec<_> = seen
+                    .iter()
+                    .filter(|seen| !seen.snapshot_holds_the_report())
+                    .collect();
+                prop_assert!(stale.is_empty(), "{stale:?}");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_shows_a_new_sequence_to_the_oracle_then_readers_then_status() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let test_provider = TestProvider::new(Path::from("/tmp/test_install_order"), object_store);
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        let reader = test_provider
+            .new_db_reader(DbReaderOptions::default(), None, None)
+            .await
+            .unwrap();
+        let served = ReaderState::clone(&reader.inner.state.read());
+        let served_seq = served.last_remote_persisted_seq;
+        let new_seq = served_seq + 1;
+        let status = DbStatusManager::new(served_seq);
+        let oracle = Arc::new(DbReaderOracle::new(served_seq, status.clone()));
+        let state = InstalledState::new(Arc::new(served.clone()), Arc::clone(&oracle));
+        let new_state = ReaderState {
+            last_remote_persisted_seq: new_seq,
+            ..served
+        };
+
+        let mut while_readers_get_the_old_state = None;
+        state.install(new_state, |_replaced, _new_state| {
+            while_readers_get_the_old_state =
+                Some((oracle.last_committed_seq(), status.status().durable_seq));
+        });
+
         assert_eq!(
-            snapshot.get(b"after").await.unwrap(),
-            Some(Bytes::from_static(b"value"))
+            while_readers_get_the_old_state,
+            Some((new_seq, served_seq)),
+            "(sequence that the oracle admits, sequence that the status reports)"
         );
-        drop(snapshot);
+        assert_eq!(state.read().last_remote_persisted_seq, new_seq);
+        assert_eq!(status.status().durable_seq, new_seq);
         reader.close().await.unwrap();
         db.close().await.unwrap();
     }
@@ -4709,14 +4885,13 @@ mod tests {
                 ..DbReaderOptions::default()
             },
             mode: DbReaderMode::ManagedCheckpoint,
-            state: parking_lot::RwLock::new(Arc::new(prior_state)),
+            state: InstalledState::new(Arc::new(prior_state), oracle),
             refresh_gate: tokio::sync::Mutex::new(()),
             retired_checkpoints: parking_lot::RwLock::new(Vec::new()),
             close_gate: tokio::sync::Mutex::new(()),
             closing: std::sync::atomic::AtomicBool::new(false),
             active_snapshots: AtomicUsize::new(0),
             system_clock: test_provider.system_clock.clone(),
-            oracle,
             reader,
             status_manager,
             segment_extractor: None,
@@ -4802,14 +4977,13 @@ mod tests {
             wal_reader,
             options: DbReaderOptions::default(),
             mode: DbReaderMode::ManagedCheckpoint,
-            state: parking_lot::RwLock::new(Arc::new(prior_state)),
+            state: InstalledState::new(Arc::new(prior_state), oracle),
             refresh_gate: tokio::sync::Mutex::new(()),
             retired_checkpoints: parking_lot::RwLock::new(Vec::new()),
             close_gate: tokio::sync::Mutex::new(()),
             closing: std::sync::atomic::AtomicBool::new(false),
             active_snapshots: AtomicUsize::new(0),
             system_clock: test_provider.system_clock.clone(),
-            oracle,
             reader,
             status_manager,
             segment_extractor: None,
