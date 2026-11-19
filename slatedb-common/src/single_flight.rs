@@ -1,39 +1,52 @@
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    future::Future,
-    hash::Hash,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, hash::Hash, sync::Arc};
 
+use futures::future::{BoxFuture, FutureExt, Shared};
 use parking_lot::Mutex as SyncMutex;
-use tokio::sync::OnceCell;
 
-type InFlightMap<K, T> = Arc<SyncMutex<HashMap<K, Arc<OnceCell<T>>>>>;
+/// The leader's func returned an error. The leader gets the error itself;
+/// every other caller of the flight retries with its own func.
+#[derive(Clone, Copy, Debug)]
+struct FlightFailed;
 
-// EntryGuard is an RAII handle that removes the map entry on drop once no other
-// callers hold a reference to it. This keeps the map from growing unboundedly and
-// ensures that after all callers for a key complete (or are cancelled), subsequent
-// calls start fresh rather than observing stale state.
-struct EntryGuard<'a, K: Hash + Eq, T> {
-    cell: Option<Arc<OnceCell<T>>>,
+/// One in-flight call. Every caller of the key polls the same shared future,
+/// so the call makes progress while any caller is polled. A leader that stops
+/// polling without dropping its call cannot block the others.
+type Flight<T> = Shared<BoxFuture<'static, Result<T, FlightFailed>>>;
+
+/// A key's flight and the number of callers that hold it.
+struct Entry<T: Clone> {
+    flight: Flight<T>,
+    callers: usize,
+}
+
+type InFlightMap<K, T> = Arc<SyncMutex<HashMap<K, Entry<T>>>>;
+
+// FlightGuard counts its caller in the key's entry while the caller waits. The
+// last caller to leave removes the entry, so a later call starts a fresh flight.
+// Removing it drops the map's handle on the shared future, and once every
+// caller's handle is gone too, a flight that is not done is cancelled.
+struct FlightGuard<'a, K: Hash + Eq, T: Clone> {
+    flight: Flight<T>,
     key: &'a K,
     in_flight: &'a InFlightMap<K, T>,
 }
 
-impl<'a, K, T> Drop for EntryGuard<'a, K, T>
+impl<'a, K, T> Drop for FlightGuard<'a, K, T>
 where
     K: Hash + Eq,
+    T: Clone,
 {
     fn drop(&mut self) {
         let mut in_flight = self.in_flight.lock();
-        // Drop our Arc *before* checking the count so we don't count ourselves.
-        drop(self.cell.take());
-        // If the only remaining Arc is the one inside the map itself, nobody else
-        // is waiting on this cell anymore—safe to clean up.
-        if in_flight
-            .get(self.key)
-            .is_some_and(|cell| Arc::strong_count(cell) == 1)
-        {
+        let Some(entry) = in_flight.get_mut(self.key) else {
+            return;
+        };
+        // The entry may already belong to a newer flight of the same key.
+        if !entry.flight.ptr_eq(&self.flight) {
+            return;
+        }
+        entry.callers -= 1;
+        if entry.callers == 0 {
             in_flight.remove(self.key);
         }
     }
@@ -41,12 +54,20 @@ where
 
 /// SingleFlight deduplicates concurrent calls for the same key, ensuring only one
 /// execution is in-flight at a time while sharing the result with all waiters.
-#[derive(Debug, Clone)]
-pub struct SingleFlight<K, T> {
+#[derive(Clone)]
+pub struct SingleFlight<K, T: Clone> {
     in_flight: InFlightMap<K, T>,
 }
 
-impl<K, T> Default for SingleFlight<K, T> {
+impl<K, T: Clone> std::fmt::Debug for SingleFlight<K, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleFlight")
+            .field("in_flight", &self.in_flight.lock().len())
+            .finish()
+    }
+}
+
+impl<K, T: Clone> Default for SingleFlight<K, T> {
     fn default() -> Self {
         Self {
             in_flight: Default::default(),
@@ -57,6 +78,7 @@ impl<K, T> Default for SingleFlight<K, T> {
 impl<K, T> SingleFlight<K, T>
 where
     K: Hash + Eq + Clone,
+    T: Clone + Send + Sync + 'static,
 {
     /// Create a new SingleFlight group.
     #[inline]
@@ -67,48 +89,82 @@ where
     /// Execute and return the value for a given function, making sure that only one
     /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
     /// wait until the original call completes and return the same value.
+    ///
+    /// Every caller of a key polls the same shared future, so the call does not depend on the
+    /// caller that started it. If that caller stops polling or is dropped, the others still
+    /// finish it. If the call fails, its caller gets the error and the others retry with their
+    /// own `func`.
     pub async fn call<F, Fut, E>(&self, key: K, func: F) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-        T: Clone,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        E: Send + 'static,
     {
-        // Acquire (or create) the shared cell for this key while briefly holding the lock.
-        // The lock is released before any async work begins.
-        let guard = {
-            let mut in_flight = self.in_flight.lock();
-            match in_flight.entry(key.clone()) {
-                // Another caller is already in-flight for this key—share their cell.
-                Entry::Occupied(occupied_entry) => EntryGuard {
-                    cell: Some(occupied_entry.get().clone()),
+        let mut func = Some(func);
+        loop {
+            // Join the key's flight, or start one, while briefly holding the lock.
+            let (guard, error) = {
+                let mut in_flight = self.in_flight.lock();
+                let (flight, error) = match in_flight.get_mut(&key) {
+                    Some(entry) => {
+                        entry.callers += 1;
+                        (entry.flight.clone(), None)
+                    }
+                    None => {
+                        // Only the caller whose func ran leaves the loop on a failure, so a
+                        // caller that starts a flight still holds its func.
+                        let func = func.take().expect("a caller starts at most one flight");
+                        let error = Arc::new(SyncMutex::new(None));
+                        let slot = Arc::clone(&error);
+                        let call = func();
+                        let flight = async move {
+                            call.await.map_err(|err| {
+                                *slot.lock() = Some(err);
+                                FlightFailed
+                            })
+                        }
+                        .boxed()
+                        .shared();
+                        in_flight.insert(
+                            key.clone(),
+                            Entry {
+                                flight: flight.clone(),
+                                callers: 1,
+                            },
+                        );
+                        (flight, Some(error))
+                    }
+                };
+                let guard = FlightGuard {
+                    flight,
                     key: &key,
                     in_flight: &self.in_flight,
-                },
-                // First caller for this key—insert a fresh OnceCell for others to find.
-                Entry::Vacant(vacant_entry) => {
-                    let e = Arc::new(OnceCell::new());
-                    vacant_entry.insert(e.clone());
-                    EntryGuard {
-                        cell: Some(e),
-                        key: &key,
-                        in_flight: &self.in_flight,
-                    }
+                };
+                (guard, error)
+            };
+            let outcome = guard.flight.clone().await;
+            if outcome.is_err() {
+                // A failed flight is never joined again, even while other
+                // callers still hold it: a retry must start a fresh one.
+                let mut in_flight = self.in_flight.lock();
+                if in_flight
+                    .get(&key)
+                    .is_some_and(|entry| entry.flight.ptr_eq(&guard.flight))
+                {
+                    in_flight.remove(&key);
                 }
             }
-        };
-
-        // get_or_try_init ensures only one caller runs `func`; others await the result.
-        // On error, the OnceCell remains uninitialized so the next waiter can retry
-        // with its own func (important for transient failures).
-        let value = guard
-            .cell
-            .as_ref()
-            .expect("cell is always Some until Drop")
-            .get_or_try_init(func)
-            .await
-            .cloned();
-
-        value
+            drop(guard);
+            match (outcome, error) {
+                (Ok(value), _) => return Ok(value),
+                (Err(FlightFailed), Some(error)) => {
+                    let err = error.lock().take();
+                    return Err(err.expect("a failed flight stores its error"));
+                }
+                // Another caller's func failed: run our own.
+                (Err(FlightFailed), None) => continue,
+            }
+        }
     }
 }
 
@@ -224,21 +280,23 @@ mod tests {
     #[tokio::test]
     async fn sequential_calls_run_fresh() {
         // After a call completes, a new call to the same key should execute its own func.
-        let call_counter = AtomicUsize::default();
+        let call_counter = Arc::new(AtomicUsize::default());
 
         let group = SingleFlight::new();
 
+        let counter = call_counter.clone();
         let result = group
-            .call("key", || async {
-                call_counter.fetch_add(1, AcqRel);
+            .call("key", || async move {
+                counter.fetch_add(1, AcqRel);
                 Ok::<_, ()>("first".to_string())
             })
             .await;
         assert_eq!(result, Ok("first".to_string()));
 
+        let counter = call_counter.clone();
         let result = group
-            .call("key", || async {
-                call_counter.fetch_add(1, AcqRel);
+            .call("key", || async move {
+                counter.fetch_add(1, AcqRel);
                 Ok::<_, ()>("second".to_string())
             })
             .await;
@@ -280,8 +338,9 @@ mod tests {
             counter.fetch_add(1, AcqRel);
             Err::<String, _>("fail")
         });
-        let fut_2 = group.call("key", || async {
-            call_counter.fetch_add(1, AcqRel);
+        let counter = call_counter.clone();
+        let fut_2 = group.call("key", || async move {
+            counter.fetch_add(1, AcqRel);
             Ok::<_, &str>("recovered".to_string())
         });
 
@@ -375,14 +434,17 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_with_concurrent_waiter() {
-        // If the initializer is cancelled but another caller is also waiting,
-        // the waiter should get to retry.
+        // If the initializer is cancelled while another caller waits, the waiter finishes the same
+        // call. It does not run its own func.
         let group = SingleFlight::<String, String>::new();
+        let gate = Arc::new(Notify::new());
 
         let g = group.clone();
+        let initializer_gate = gate.clone();
         let initializer = tokio::spawn(async move {
-            g.call("key".to_string(), || {
-                std::future::pending::<Result<String, ()>>()
+            g.call("key".to_string(), || async move {
+                initializer_gate.notified().await;
+                Ok::<_, ()>("shared".to_string())
             })
             .await
         });
@@ -394,8 +456,9 @@ mod tests {
         let g = group.clone();
         let waiter = tokio::spawn(async move {
             g.call("key".to_string(), || async {
-                // This func runs if the waiter gets to retry after cancellation.
-                Ok::<_, ()>("retried".to_string())
+                panic!("the waiter must finish the initializer's call");
+                #[allow(unreachable_code)]
+                Ok::<_, ()>(String::new())
             })
             .await
         });
@@ -403,13 +466,47 @@ mod tests {
         // Let the waiter register and start waiting.
         tokio::task::yield_now().await;
 
-        // Cancel the initializer.
+        // Cancel the initializer, then let its call finish.
         initializer.abort();
         let _ = initializer.await;
+        gate.notify_one();
 
-        // The waiter should retry and succeed.
         let result = waiter.await.expect("task panicked");
-        assert_eq!(result, Ok("retried".to_string()));
+        assert_eq!(result, Ok("shared".to_string()));
+    }
+
+    // A caller can poll its call once, so it starts the flight, and then
+    // stop polling it without dropping it: an SST iterator keeps a block
+    // fetch in its queue when its own caller cancels `next`. The flight must
+    // still finish for every other caller of that key. On turbolay-prod
+    // (2026-11-18) a parked fetch held block reads of one SST part for
+    // 40 minutes while its leader's own S3 get never ran.
+    #[tokio::test]
+    async fn parked_leader_does_not_block_waiters() {
+        let group = SingleFlight::<&str, String>::new();
+        let gate = Arc::new(Notify::new());
+
+        let leader_gate = gate.clone();
+        let mut leader = Box::pin(group.call("key", move || async move {
+            leader_gate.notified().await;
+            Ok::<_, ()>("value".to_string())
+        }));
+        // Poll the leader until its func is waiting on the gate, then park it.
+        tokio::select! {
+            biased;
+            _ = &mut leader => panic!("the leader cannot finish before the gate opens"),
+            _ = tokio::task::yield_now() => {}
+        }
+        gate.notify_one();
+
+        let waiter = group.call("key", || async {
+            panic!("the waiter must share the leader's flight")
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("a parked leader must not block its waiters");
+        assert_eq!(result, Ok::<_, ()>("value".to_string()));
+        drop(leader);
     }
 
     #[tokio::test]

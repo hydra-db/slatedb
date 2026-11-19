@@ -34,18 +34,24 @@ impl Downloads {
 impl Inner {
     /// Downloads `path` and installs it, replacing any local copy. The caller
     /// must hold a download ticket for `path`.
-    pub(crate) async fn download(&self, path: &Path) -> object_store::Result<Arc<LocalObject>> {
+    pub(crate) async fn download(
+        self: &Arc<Self>,
+        path: &Path,
+    ) -> object_store::Result<Arc<LocalObject>> {
         let name = LocalName::new(path);
+        // The flight owns what it uses: another caller may finish it.
+        let inner = Arc::clone(self);
+        let owned = path.clone();
         self.downloads
             .flights
-            .call(path.clone(), || async {
-                let _permit = self
+            .call(path.clone(), || async move {
+                let _permit = inner
                     .downloads
                     .permits
                     .acquire()
                     .await
                     .expect("download semaphore is never closed");
-                self.retry.run(|| self.download_once(path, &name)).await
+                inner.retry.run(|| inner.download_once(&owned, &name)).await
             })
             .await
     }
