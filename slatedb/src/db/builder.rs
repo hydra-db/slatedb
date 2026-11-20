@@ -101,6 +101,7 @@
 //! }
 //! ```
 //!
+use crate::resident_filters::ResidentFilterBudget;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -202,6 +203,7 @@ pub struct DbBuilder<P: Into<Path>> {
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
     expected_epoch: Option<u64>,
+    resident_filters: Option<Arc<ResidentFilterBudget>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -236,6 +238,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             segment_extractor: None,
             wal_writer_init: None,
             expected_epoch: None,
+            resident_filters: None,
         }
     }
 
@@ -321,6 +324,14 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Disables the sst block/metadata cache
     pub fn with_db_cache_disabled(mut self) -> Self {
         self.db_cache = None;
+        self
+    }
+
+    /// Keeps each SST's decoded filters on its handle after the first read,
+    /// within `budget`, so later reads probe them without a cache lookup.
+    /// One budget can be shared by every `Db` and `DbReader` in a process.
+    pub fn with_resident_filter_budget(mut self, budget: Arc<ResidentFilterBudget>) -> Self {
+        self.resident_filters = Some(budget);
         self
     }
 
@@ -658,15 +669,18 @@ impl<P: Into<Path>> DbBuilder<P> {
                 db_cache.db_cache_id,
             )) as Arc<dyn DbCache>
         });
-        let table_store = Arc::new(TableStore::new_with_fp_registry(
-            retrying_main_object_store.clone(),
-            sst_format.clone(),
-            path_resolver.clone(),
-            self.fp_registry.clone(),
-            db_cache.clone(),
-            TableStoreKind::Main,
-            self.block_cache_policy.clone(),
-        ));
+        let table_store = Arc::new(
+            TableStore::new_with_fp_registry(
+                retrying_main_object_store.clone(),
+                sst_format.clone(),
+                path_resolver.clone(),
+                self.fp_registry.clone(),
+                db_cache.clone(),
+                TableStoreKind::Main,
+                self.block_cache_policy.clone(),
+            )
+            .with_resident_filters(self.resident_filters.clone()),
+        );
         let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
             wal_object_store,
             sst_format.clone(),
@@ -1870,6 +1884,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
+    resident_filters: Option<Arc<ResidentFilterBudget>>,
 }
 
 impl<P: Into<Path>> DbReaderBuilder<P> {
@@ -1890,6 +1905,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
+            resident_filters: None,
         }
     }
 
@@ -1963,6 +1979,14 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     /// Disables the sst block/metadata cache
     pub fn with_db_cache_disabled(mut self) -> Self {
         self.db_cache = None;
+        self
+    }
+
+    /// Keeps each SST's decoded filters on its handle after the first read,
+    /// within `budget`, so later reads probe them without a cache lookup.
+    /// One budget can be shared by every `Db` and `DbReader` in a process.
+    pub fn with_resident_filter_budget(mut self, budget: Arc<ResidentFilterBudget>) -> Self {
+        self.resident_filters = Some(budget);
         self
     }
 
@@ -2122,15 +2146,18 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         };
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
         let fp_registry = Arc::new(FailPointRegistry::new());
-        let table_store = Arc::new(TableStore::new_with_fp_registry(
-            retrying_object_store,
-            sst_format.clone(),
-            path_resolver.clone(),
-            Arc::clone(&fp_registry),
-            wrapped_cache,
-            TableStoreKind::Reader,
-            BlockCachePolicy::default(),
-        ));
+        let table_store = Arc::new(
+            TableStore::new_with_fp_registry(
+                retrying_object_store,
+                sst_format.clone(),
+                path_resolver.clone(),
+                Arc::clone(&fp_registry),
+                wrapped_cache,
+                TableStoreKind::Reader,
+                BlockCachePolicy::default(),
+            )
+            .with_resident_filters(self.resident_filters.clone()),
+        );
         let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
             wal_object_store,
             sst_format,

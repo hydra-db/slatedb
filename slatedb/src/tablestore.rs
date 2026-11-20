@@ -1,3 +1,4 @@
+use crate::resident_filters::ResidentFilterBudget;
 use std::collections::VecDeque;
 use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
@@ -55,6 +56,8 @@ pub(crate) struct TableStore {
     block_cache_policy: BlockCachePolicy,
     /// Which component owns this store. Tagged on compacted-SST calls.
     kind: TableStoreKind,
+    /// Keeps decoded filters on SST handles, within this budget.
+    resident_filters: Option<Arc<ResidentFilterBudget>>,
 }
 
 fn record_read_cached(span: &tracing::Span, lookup: CacheLookup) {
@@ -106,7 +109,18 @@ impl TableStore {
             cache,
             block_cache_policy,
             kind,
+            resident_filters: None,
         }
+    }
+
+    /// Keeps the decoded filters of each SST this store reads on the SST's
+    /// handle, within `budget`.
+    pub(crate) fn with_resident_filters(
+        mut self,
+        budget: Option<Arc<ResidentFilterBudget>>,
+    ) -> Self {
+        self.resident_filters = budget;
+        self
     }
 
     /// Gracefully close the block cache, flushing in-memory entries to disk.
@@ -422,9 +436,18 @@ impl TableStore {
         if self.sst_format.filter_policies.is_empty() || handle.info.filter_len == 0 {
             return Ok(Arc::from([]));
         }
+        if let Some(filters) = handle.resident.get() {
+            return Ok(Arc::clone(filters));
+        }
         let span = trace.new_read_filter_span(handle.id, sst_level);
         let read = self.read_filters_inner(handle, cache_blocks, segment, span.clone());
-        read.instrument(span).await
+        let filters = read.instrument(span).await?;
+        if let Some(budget) = &self.resident_filters {
+            handle
+                .resident
+                .fill(&filters, budget, handle.info.filter_len);
+        }
+        Ok(filters)
     }
 
     async fn read_filters_inner(
