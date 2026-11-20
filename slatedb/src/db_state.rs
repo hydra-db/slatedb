@@ -27,6 +27,11 @@ pub struct SsTableHandle {
 
     /// Metadata information about this SSTable.
     pub info: SsTableInfo,
+
+    /// The SST's decoded filters, once a read under a resident filter budget
+    /// keeps them. Shared by every clone of this handle.
+    #[serde(skip)]
+    pub(crate) resident: Arc<crate::resident_filters::ResidentSlot>,
 }
 
 impl Debug for SsTableHandle {
@@ -41,6 +46,7 @@ impl SsTableHandle {
             id,
             format_version,
             info,
+            resident: Arc::default(),
         }
     }
 
